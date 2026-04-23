@@ -54,3 +54,8 @@ def percent_text(done: int, total: int) -> str:
     if not total:
         return "0%"
     return f"{(done / total) * 100:.1f}%"
+
+
+def mb_text(size: int) -> str:
+    value = max(int(size or 0), 0) / (1024**2)
+    return f"{value:.2f} مگابایت"

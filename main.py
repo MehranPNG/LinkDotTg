@@ -39,6 +39,7 @@ from utils import (
     generate_auth_key,
     generate_password,
     human_size,
+    mb_text,
     now_ts,
     percent_text,
     random_text,
@@ -110,6 +111,7 @@ queue_lock = asyncio.Lock()
 processing_queue: deque[str] = deque()
 running_batches: set[str] = set()
 running_users: set[int] = set()
+retry_deadlines: Dict[str, Dict[str, int]] = {}
 
 
 def get_reserved_bytes() -> int:
@@ -421,6 +423,16 @@ async def safe_answer_callback(
         await callback_query.answer(text or "", show_alert=show_alert)
 
 
+async def add_eye_reaction(chat_id: int, message_id: int) -> None:
+    with suppress(Exception):
+        await telegram_app.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=["👀"],
+            is_big=False,
+        )
+
+
 def queue_status_text(position: int, total_queued: int) -> str:
     return (
         "⏳ بسته شما در صف قرار گرفت.\n\n"
@@ -507,15 +519,41 @@ async def update_status(job: Dict[str, Any], stage: str, force: bool = False) ->
         package_done = int(job.get("package_done", 0) or 0)
         speed_text = job.get("speed_text")
         lines = [stage]
-        if speed_text:
-            lines.append(f"🚀 سرعت: {speed_text}")
-        if current_file_name:
-            lines.append(f"📄 فایل فعلی: {current_file_name}")
-        lines.append(
-            f"📤 فایل فعلی: {human_size(current_file_done)} / {human_size(current_file_total)}"
-        )
-        lines.append(f"📦 کل بسته: {human_size(package_done)} / {human_size(total_size)}")
-        lines.append(f"📊 پیشرفت بسته: {percent_text(package_done, total_size)}")
+        if stage == "📥 در حال دانلود...":
+            if speed_text:
+                lines.append(f"🚀 سرعت: {speed_text}")
+            if current_file_name:
+                lines.append(f"📄 فایل فعلی: {current_file_name}")
+            lines.append(
+                f"📤 پیشرفت فایل: {mb_text(current_file_done)} / {mb_text(current_file_total)}"
+            )
+            lines.append(
+                f"📦 پیشرفت کل: {mb_text(package_done)} / {mb_text(total_size)}"
+            )
+            lines.append(f"📊 درصد پیشرفت کل: {percent_text(package_done, total_size)}")
+        elif stage == "🗜️ در حال فشرده‌سازی...":
+            if current_file_name:
+                lines.append(f"📄 نام فایل: {current_file_name}")
+            lines.append(
+                f"📦 حجم: {mb_text(current_file_done)} / {mb_text(current_file_total)}"
+            )
+            lines.append(f"📊 درصد پیشرفت: {percent_text(current_file_done, current_file_total)}")
+        elif stage == "☁️ در حال آپلود به روبیکا...":
+            if current_file_name:
+                lines.append(f"📄 نام فایل: {current_file_name}")
+            lines.append(f"📦 حجم کل: {mb_text(current_file_total)}")
+        else:
+            if speed_text:
+                lines.append(f"🚀 سرعت: {speed_text}")
+            if current_file_name:
+                lines.append(f"📄 فایل فعلی: {current_file_name}")
+            lines.append(
+                f"📤 فایل فعلی: {human_size(current_file_done)} / {human_size(current_file_total)}"
+            )
+            lines.append(
+                f"📦 کل بسته: {human_size(package_done)} / {human_size(total_size)}"
+            )
+            lines.append(f"📊 پیشرفت بسته: {percent_text(package_done, total_size)}")
         text = "\n".join(lines)
 
         now = time.monotonic()
@@ -787,37 +825,38 @@ async def cleanup_upload_failed(batch_id: str) -> None:
     conn.commit()
 
 
-async def auto_cancel_processing(job: Dict[str, Any]) -> None:
-    await asyncio.sleep(AUTO_CANCEL_SECONDS)
-    if job.get("cancelled"):
-        return
-    job["cancelled"] = True
-    task = job.get("task")
-    if task and not task.done():
-        task.cancel()
-
-
-async def handle_upload_retry_timeout(
-    batch_id: str, chat_id: int, retry_msg_id: int
-) -> None:
-    await asyncio.sleep(RETRY_WINDOW_SECONDS)
-    if batch_id not in active_batches or not active_batches[batch_id].get(
-        "upload_failed", False
-    ):
-        return
-    batch = active_batches[batch_id]
-    try:
-        await telegram_app.edit_message_text(
-            chat_id=chat_id,
-            message_id=retry_msg_id,
-            text="⏰ زمان درخواست امتحان مجدد به پایان رسید.\nفرایند به طور خودکار لغو شد.",
-            reply_markup=None,
-        )
-    except Exception:
-        pass
-    set_batch_status(batch_id, "cancelled")
-    await cleanup_upload_failed(batch_id)
-    active_batches.pop(batch_id, None)
+async def cron_watchdog() -> None:
+    while True:
+        now = now_ts()
+        for job_id, job in list(active_jobs.items()):
+            deadline = int(job.get("auto_cancel_deadline", 0) or 0)
+            if deadline and now >= deadline and not job.get("cancelled"):
+                job["cancelled"] = True
+                task = job.get("task")
+                if task and not task.done():
+                    task.cancel()
+        for batch_id, data in list(retry_deadlines.items()):
+            deadline = int(data.get("deadline", 0) or 0)
+            if now < deadline:
+                continue
+            batch = active_batches.get(batch_id)
+            if not batch or not batch.get("upload_failed", False):
+                retry_deadlines.pop(batch_id, None)
+                continue
+            chat_id = int(data["chat_id"])
+            retry_msg_id = int(data["retry_msg_id"])
+            with suppress(Exception):
+                await telegram_app.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=retry_msg_id,
+                    text="⏰ زمان درخواست امتحان مجدد به پایان رسید.\nفرایند به طور خودکار لغو شد.",
+                    reply_markup=None,
+                )
+            set_batch_status(batch_id, "cancelled")
+            await cleanup_upload_failed(batch_id)
+            active_batches.pop(batch_id, None)
+            retry_deadlines.pop(batch_id, None)
+        await asyncio.sleep(1)
 
 
 def get_rubika_chat_guid(update) -> Optional[str]:
@@ -910,6 +949,7 @@ async def finalize_collection(collection_key: str) -> None:
     batch["batch_id"] = batch_id
     batch["total_size"] = total_size
     batch["total_files"] = total_files
+    batch["last_source_message_id"] = batch["files"][-1]["message_id"]
     batch["status"] = "pending"
     create_batch_record(
         batch_id, batch["telegram_id"], total_files, total_size, "pending"
@@ -1037,9 +1077,10 @@ async def process_confirmed_batch(batch_id: str, chat_id: int) -> None:
         "current_file_total": 0,
         "current_file_done": 0,
         "cancel_confirm_shown": False,
+        "cancel_prompt_message": None,
+        "auto_cancel_deadline": now_ts() + AUTO_CANCEL_SECONDS,
         "task": asyncio.current_task(),
     }
-    job["auto_cancel_task"] = asyncio.create_task(auto_cancel_processing(job))
     active_jobs[job_id] = job
     batch["job_id"] = job_id
     download_dir = FILES_DIR / batch_id
@@ -1134,6 +1175,7 @@ async def process_confirmed_batch(batch_id: str, chat_id: int) -> None:
             await telegram_app.send_message(
                 chat_id,
                 f"✅ ارسال با موفقیت انجام شد\n\n🗂️ نام فایل:\n`{zip_name}`\n🔐 پسورد فایل:\n`{password}`",
+                reply_to_message_id=batch.get("last_source_message_id"),
             )
         else:
             set_batch_status(
@@ -1154,10 +1196,11 @@ async def process_confirmed_batch(batch_id: str, chat_id: int) -> None:
                 error_text,
                 reply_markup=retry_markup,
             )
-            retry_timeout_task = asyncio.create_task(
-                handle_upload_retry_timeout(batch_id, chat_id, retry_msg.id)
-            )
-            batch["retry_timeout_task"] = retry_timeout_task
+            retry_deadlines[batch_id] = {
+                "chat_id": chat_id,
+                "retry_msg_id": retry_msg.id,
+                "deadline": now_ts() + RETRY_WINDOW_SECONDS,
+            }
     except asyncio.CancelledError:
         set_batch_status(batch_id, "cancelled")
         cursor.execute(
@@ -1165,6 +1208,10 @@ async def process_confirmed_batch(batch_id: str, chat_id: int) -> None:
             (batch_id,),
         )
         conn.commit()
+        prompt_message = job.get("cancel_prompt_message")
+        if prompt_message:
+            with suppress(Exception):
+                await prompt_message.edit_text("⛔ فرایند لغو شد")
         with suppress(Exception):
             await safe_edit(
                 job["status_message"], "⛔ فرایند لغو شد", reply_markup=None
@@ -1187,9 +1234,6 @@ async def process_confirmed_batch(batch_id: str, chat_id: int) -> None:
                 processing_queue.remove(batch_id)
             running_batches.discard(batch_id)
             running_users.discard(chat_id)
-        auto_cancel_task = job.get("auto_cancel_task")
-        if auto_cancel_task and not auto_cancel_task.done():
-            auto_cancel_task.cancel()
         await release_space(batch_id, status="released")
         should_cleanup = True
         if batch_id in active_batches and active_batches[batch_id].get(
@@ -1200,6 +1244,8 @@ async def process_confirmed_batch(batch_id: str, chat_id: int) -> None:
             await cleanup_paths(*local_paths)
             await cleanup_paths(str(zip_path))
             await cleanup_paths(str(download_dir))
+        if batch_id in retry_deadlines:
+            retry_deadlines.pop(batch_id, None)
         active_jobs.pop(job_id, None)
         if batch_id in active_batches and not active_batches[batch_id].get(
             "upload_failed", False
@@ -1372,15 +1418,37 @@ async def on_callback_query(client, callback_query):
             )
             return
         batch["rubika_guid"] = user["rubika_guid"]
-        batch["status"] = "queued"
-        batch["queue_message"] = callback_query.message
-        set_batch_status(batch_id, "queued", rubika_guid=user["rubika_guid"])
-        position = await enqueue_batch(batch_id)
-        await safe_edit(
-            callback_query.message,
-            queue_status_text(position, len(processing_queue)),
-        )
-        await maybe_start_queued_batches()
+        set_batch_status(batch_id, "confirmed", rubika_guid=user["rubika_guid"])
+        last_message_id = batch.get("last_source_message_id")
+        if last_message_id:
+            await add_eye_reaction(callback_query.message.chat.id, int(last_message_id))
+        async with queue_lock:
+            can_start_now = (
+                len(running_batches) < MAX_CONCURRENT_PROCESSES
+                and int(batch["telegram_id"]) not in running_users
+                and len(processing_queue) == 0
+            )
+        if can_start_now:
+            with suppress(Exception):
+                await callback_query.message.delete()
+            async with queue_lock:
+                running_batches.add(batch_id)
+                running_users.add(int(batch["telegram_id"]))
+            batch["status"] = "active"
+            set_batch_status(batch_id, "active", rubika_guid=user["rubika_guid"])
+            batch["processing_task"] = asyncio.create_task(
+                process_confirmed_batch(batch_id, callback_query.message.chat.id)
+            )
+        else:
+            batch["status"] = "queued"
+            batch["queue_message"] = callback_query.message
+            set_batch_status(batch_id, "queued", rubika_guid=user["rubika_guid"])
+            position = await enqueue_batch(batch_id)
+            await safe_edit(
+                callback_query.message,
+                queue_status_text(position, len(processing_queue)),
+            )
+            await maybe_start_queued_batches()
         return
 
     if data.startswith("job_cancel:"):
@@ -1390,8 +1458,12 @@ async def on_callback_query(client, callback_query):
         if job and not job.get("cancelled"):
             async with job.get("status_lock", asyncio.Lock()):
                 job["cancel_confirm_shown"] = True
-                await safe_edit(
-                    job["status_message"],
+                old_prompt = job.get("cancel_prompt_message")
+                if old_prompt:
+                    with suppress(Exception):
+                        await old_prompt.delete()
+                job["cancel_prompt_message"] = await telegram_app.send_message(
+                    callback_query.message.chat.id,
                     "⚠️ مطمئن هستید می‌خواهید فرایند را لغو کنید؟\n\nاین عملیات غیرقابل بازگشت است.",
                     reply_markup=job_cancel_confirm_keyboard(job_id),
                 )
@@ -1408,10 +1480,10 @@ async def on_callback_query(client, callback_query):
                 task = job.get("task")
                 if task and not task.done():
                     task.cancel()
-                with suppress(Exception):
-                    await safe_edit(
-                        job["status_message"], "⛔ فرایند لغو شد", reply_markup=None
-                    )
+                prompt_message = job.get("cancel_prompt_message")
+                if prompt_message:
+                    with suppress(Exception):
+                        await prompt_message.edit_text("⛔ فرایند لغو شد")
         return
 
     if data.startswith("job_cancel_cancel:"):
@@ -1421,12 +1493,11 @@ async def on_callback_query(client, callback_query):
         if job:
             async with job.get("status_lock", asyncio.Lock()):
                 job["cancel_confirm_shown"] = False
-                with suppress(Exception):
-                    await safe_edit(
-                        job["status_message"],
-                        job.get("last_text") or "⏳ در حال پردازش...",
-                        reply_markup=progress_keyboard(job_id),
-                    )
+                prompt_message = job.get("cancel_prompt_message")
+                if prompt_message:
+                    with suppress(Exception):
+                        await prompt_message.delete()
+                job["cancel_prompt_message"] = None
         return
 
     if data.startswith("upload_retry:"):
@@ -1441,9 +1512,7 @@ async def on_callback_query(client, callback_query):
             )
             return
         batch = active_batches[batch_id]
-        timeout_task = batch.get("retry_timeout_task")
-        if timeout_task and not timeout_task.done():
-            timeout_task.cancel()
+        retry_deadlines.pop(batch_id, None)
         await safe_edit(
             callback_query.message,
             "☁️ در حال آپلود مجدد به روبیکا...",
@@ -1464,6 +1533,7 @@ async def on_callback_query(client, callback_query):
             await telegram_app.send_message(
                 callback_query.message.chat.id,
                 f"✅ ارسال با موفقیت انجام شد\n\n🗂️ نام فایل:\n`{batch['zip_name']}`\n🔐 پسورد فایل:\n`{batch.get('password')}`",
+                reply_to_message_id=batch.get("last_source_message_id"),
             )
             await cleanup_upload_failed(batch_id)
             active_batches.pop(batch_id, None)
@@ -1473,12 +1543,11 @@ async def on_callback_query(client, callback_query):
                 f"❌ خطا در آپلود مجدد:\n{str(retry_exc)[:500]}\n\n🔄 می‌توانید دوباره امتحان کنید.",
                 reply_markup=upload_retry_keyboard(batch_id),
             )
-            new_timeout = asyncio.create_task(
-                handle_upload_retry_timeout(
-                    batch_id, callback_query.message.chat.id, callback_query.message.id
-                )
-            )
-            batch["retry_timeout_task"] = new_timeout
+            retry_deadlines[batch_id] = {
+                "chat_id": callback_query.message.chat.id,
+                "retry_msg_id": callback_query.message.id,
+                "deadline": now_ts() + RETRY_WINDOW_SECONDS,
+            }
         return
 
     await safe_answer_callback(callback_query)
@@ -1486,11 +1555,15 @@ async def on_callback_query(client, callback_query):
 
 async def main_runner():
     await telegram_app.start()
+    watchdog_task = asyncio.create_task(cron_watchdog())
     try:
         rubika_app.add_handler(on_rubika_update, rub_handlers.MessageUpdates())
     except Exception:
         pass
-    await rubika_app.run()
+    try:
+        await rubika_app.run()
+    finally:
+        watchdog_task.cancel()
 
 
 if __name__ == "__main__":
