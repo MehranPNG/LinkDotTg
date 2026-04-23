@@ -6,6 +6,7 @@ import sqlite3
 import time
 import pyzipper
 import aiohttp
+from collections import deque
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,6 +26,7 @@ from config import (
     DB_PATH,
     FILES_DIR,
     MAX_UPLOAD_SIZE,
+    MAX_CONCURRENT_PROCESSES,
     RETRY_WINDOW_SECONDS,
     RUBIKA_SESSION_NAME,
     SESSIONS_DIR,
@@ -103,8 +105,11 @@ rubika_app = RubikaClient(RUBIKA_SESSION_NAME, timeout=UPLOAD_TIMEOUT_SECONDS)
 pending_collections: Dict[str, Dict[str, Any]] = {}
 active_batches: Dict[str, Dict[str, Any]] = {}
 active_jobs: Dict[str, Dict[str, Any]] = {}
-processing_locks: Dict[int, asyncio.Lock] = {}
 db_lock = asyncio.Lock()
+queue_lock = asyncio.Lock()
+processing_queue: deque[str] = deque()
+running_batches: set[str] = set()
+running_users: set[int] = set()
 
 
 def get_reserved_bytes() -> int:
@@ -416,6 +421,75 @@ async def safe_answer_callback(
         await callback_query.answer(text or "", show_alert=show_alert)
 
 
+def queue_status_text(position: int, total_queued: int) -> str:
+    return (
+        "⏳ بسته شما در صف قرار گرفت.\n\n"
+        f"🔢 جایگاه در صف: {position} از {total_queued}\n"
+        f"⚙️ ظرفیت پردازش همزمان: {MAX_CONCURRENT_PROCESSES}\n\n"
+        "مراحل بعدی:\n"
+        "1) دانلود فایل‌ها\n"
+        "2) فشرده‌سازی ZIP\n"
+        "3) آپلود به روبیکا"
+    )
+
+
+async def refresh_queue_messages_locked() -> None:
+    total_queued = len(processing_queue)
+    for index, queued_batch_id in enumerate(processing_queue, start=1):
+        queued_batch = active_batches.get(queued_batch_id)
+        if not queued_batch:
+            continue
+        queued_message = queued_batch.get("queue_message")
+        if not queued_message:
+            continue
+        text = queue_status_text(index, total_queued)
+        if text == queued_batch.get("last_queue_text"):
+            continue
+        queued_batch["queue_message"] = await safe_edit(queued_message, text)
+        queued_batch["last_queue_text"] = text
+
+
+async def maybe_start_queued_batches() -> None:
+    async with queue_lock:
+        made_progress = True
+        while (
+            made_progress
+            and len(running_batches) < MAX_CONCURRENT_PROCESSES
+            and processing_queue
+        ):
+            made_progress = False
+            for batch_id in list(processing_queue):
+                batch = active_batches.get(batch_id)
+                if not batch or batch.get("status") not in {"queued", "confirmed"}:
+                    with suppress(ValueError):
+                        processing_queue.remove(batch_id)
+                    made_progress = True
+                    continue
+                telegram_id = int(batch["telegram_id"])
+                if telegram_id in running_users:
+                    continue
+                processing_queue.remove(batch_id)
+                running_batches.add(batch_id)
+                running_users.add(telegram_id)
+                batch["status"] = "active"
+                set_batch_status(batch_id, "active")
+                batch["processing_task"] = asyncio.create_task(
+                    process_confirmed_batch(batch_id, telegram_id)
+                )
+                made_progress = True
+                if len(running_batches) >= MAX_CONCURRENT_PROCESSES:
+                    break
+        await refresh_queue_messages_locked()
+
+
+async def enqueue_batch(batch_id: str) -> int:
+    async with queue_lock:
+        if batch_id not in processing_queue:
+            processing_queue.append(batch_id)
+        await refresh_queue_messages_locked()
+        return list(processing_queue).index(batch_id) + 1
+
+
 async def update_status(job: Dict[str, Any], stage: str, force: bool = False) -> None:
     if "status_lock" not in job:
         job["status_lock"] = asyncio.Lock()
@@ -426,50 +500,23 @@ async def update_status(job: Dict[str, Any], stage: str, force: bool = False) ->
         if job.get("cancelled"):
             raise asyncio.CancelledError()
 
-        if stage.startswith("☁️"):
-            text = f"{stage}\n💾 حجم کل: {human_size(job.get('total_size', 0))}"
-        else:
-            total_files = job.get("total_files", 0)
-            downloaded_files = job.get("downloaded_files", 0)
-            processed_files = job.get("processed_files", 0)
-            total_size = job.get("total_size", 0)
-            downloaded_bytes = job.get("downloaded_bytes", 0)
-            processed_bytes = job.get("processed_bytes", 0)
-            current_file_name = job.get("current_file_name")
-            current_file_done = job.get("current_file_done", 0)
-            current_file_total = job.get("current_file_total", 0)
-            lines = [stage]
-
-            if total_files:
-                if stage.startswith("📥"):
-                    lines.append(f"📦 فایل‌ها: {downloaded_files}/{total_files}")
-                    lines.append(
-                        f"💾 حجم کل: {human_size(downloaded_bytes)} / {human_size(total_size)}"
-                    )
-                    lines.append(
-                        f"📊 پیشرفت کل: {percent_text(downloaded_bytes, total_size)}"
-                    )
-                    if job.get("download_speed"):
-                        lines.append(f"📈 سرعت دانلود: {job['download_speed']} MB/s")
-                elif stage.startswith("🗜️"):
-                    lines.append(f"📦 فایل‌ها: {processed_files}/{total_files}")
-                    lines.append(
-                        f"💾 حجم کل: {human_size(processed_bytes)} / {human_size(total_size)}"
-                    )
-                    lines.append(
-                        f"📊 پیشرفت کل: {percent_text(processed_bytes, total_size)}"
-                    )
-
-            if current_file_name:
-                lines.append(f"📄 فایل فعلی: {current_file_name}")
-                if current_file_total:
-                    lines.append(
-                        f"↳ {human_size(current_file_done)} / {human_size(current_file_total)}"
-                    )
-                    lines.append(
-                        f"↳ پیشرفت فایل: {percent_text(current_file_done, current_file_total)}"
-                    )
-            text = "\n".join(lines)
+        total_size = int(job.get("total_size", 0) or 0)
+        current_file_name = job.get("current_file_name")
+        current_file_done = int(job.get("current_file_done", 0) or 0)
+        current_file_total = int(job.get("current_file_total", 0) or 0)
+        package_done = int(job.get("package_done", 0) or 0)
+        speed_text = job.get("speed_text")
+        lines = [stage]
+        if speed_text:
+            lines.append(f"🚀 سرعت: {speed_text}")
+        if current_file_name:
+            lines.append(f"📄 فایل فعلی: {current_file_name}")
+        lines.append(
+            f"📤 فایل فعلی: {human_size(current_file_done)} / {human_size(current_file_total)}"
+        )
+        lines.append(f"📦 کل بسته: {human_size(package_done)} / {human_size(total_size)}")
+        lines.append(f"📊 پیشرفت بسته: {percent_text(package_done, total_size)}")
+        text = "\n".join(lines)
 
         now = time.monotonic()
         if (
@@ -520,6 +567,7 @@ async def monitored_download(
     job["downloaded_files"] = file_index - 1
     job["downloaded_bytes"] = total_before
     job["download_speed"] = "0.0"
+    job["speed_text"] = "0.0 MB/s"
     await update_status(job, "📥 در حال دانلود...", force=True)
 
     last_percent = -1
@@ -543,15 +591,16 @@ async def monitored_download(
             delta_bytes = current_value - last_bytes
             if delta_time > 0:
                 speed = delta_bytes / delta_time / (1024**2)
-                job["download_speed"] = f"{speed:.1f}"
+                job["speed_text"] = f"{speed:.1f} MB/s"
             else:
-                job["download_speed"] = "0.0"
+                job["speed_text"] = "0.0 MB/s"
             last_percent = percent
             last_bytes = current_value
             last_time = now
             job["current_file_done"] = current_value
             job["current_file_total"] = total_value
             job["downloaded_bytes"] = total_before + current_value
+            job["package_done"] = total_before + current_value
             job["downloaded_files"] = (
                 file_index - 1 + (1 if current_value == total_value else 0)
             )
@@ -576,10 +625,11 @@ async def monitored_download(
     if job.get("cancelled"):
         raise asyncio.CancelledError()
     job["downloaded_bytes"] = total_before + total
+    job["package_done"] = total_before + total
     job["downloaded_files"] = file_index
     job["current_file_done"] = total
     job["current_file_total"] = total
-    job["download_speed"] = "0.0"
+    job["speed_text"] = "0.0 MB/s"
     await update_status(job, "📥 در حال دانلود...", force=True)
     return str(target_path)
 
@@ -594,6 +644,7 @@ async def zip_files_with_progress(
     processed = 0
     job["processed_files"] = 0
     job["processed_bytes"] = 0
+    job["speed_text"] = "0.0 MB/s"
     job["current_file_name"] = None
     await update_status(job, "🗜️ در حال فشرده‌سازی...", force=True)
     last_time = time.monotonic()
@@ -614,6 +665,7 @@ async def zip_files_with_progress(
             job["current_file_name"] = arcname
             job["current_file_total"] = file_size
             job["current_file_done"] = 0
+            job["last_processed_file_done"] = 0
             await update_status(job, "🗜️ در حال فشرده‌سازی...")
             with open(source_path, "rb") as src, zf.open(arcname, "w") as dest:
                 while True:
@@ -628,8 +680,19 @@ async def zip_files_with_progress(
                     await asyncio.sleep(0)
                     now = time.monotonic()
                     if current_done == file_size or now - last_time >= 1.0:
+                        delta_time = now - last_time
+                        if delta_time > 0:
+                            delta_bytes = current_done - int(
+                                job.get("last_processed_file_done", 0) or 0
+                            )
+                            speed = max(delta_bytes, 0) / delta_time / (1024**2)
+                            job["speed_text"] = f"{speed:.1f} MB/s"
+                        else:
+                            job["speed_text"] = "0.0 MB/s"
+                        job["last_processed_file_done"] = current_done
                         last_time = now
                         job["processed_bytes"] = processed
+                        job["package_done"] = processed
                         job["processed_files"] = (
                             index - 1 + (1 if current_done >= file_size else 0)
                         )
@@ -641,6 +704,8 @@ async def zip_files_with_progress(
             await reduce_reservation(job["batch_id"], file_size)
 
     job["processed_bytes"] = total_size
+    job["package_done"] = total_size
+    job["speed_text"] = "0.0 MB/s"
     job["processed_files"] = len(files)
     await update_status(job, "🗜️ فشرده‌سازی کامل شد", force=True)
     return str(zip_path)
@@ -656,6 +721,11 @@ async def monitored_rubika_send(
     if job is not None:
         job["uploaded_bytes"] = 0
         job["uploaded_files"] = 0
+        job["current_file_name"] = file_name
+        job["current_file_done"] = 0
+        job["current_file_total"] = size
+        job["package_done"] = 0
+        job["speed_text"] = None
         await update_status(job, "☁️ در حال آپلود به روبیکا...", force=True)
 
     sent = None
@@ -698,6 +768,9 @@ async def monitored_rubika_send(
     if job is not None:
         job["uploaded_bytes"] = size
         job["uploaded_files"] = 1
+        job["current_file_done"] = size
+        job["current_file_total"] = size
+        job["package_done"] = size
         await update_status(job, "☁️ آپلود به روبیکا کامل شد", force=True)
     return sent
 
@@ -920,7 +993,7 @@ async def process_confirmed_batch(batch_id: str, chat_id: int) -> None:
     batch = active_batches.get(batch_id)
     if not batch:
         return
-    if batch.get("status") in {"active", "done"}:
+    if batch.get("status") in {"done"}:
         return
     if batch["total_size"] > MAX_UPLOAD_SIZE:
         await telegram_app.send_message(
@@ -959,6 +1032,7 @@ async def process_confirmed_batch(batch_id: str, chat_id: int) -> None:
         "processed_bytes": 0,
         "uploaded_files": 0,
         "uploaded_bytes": 0,
+        "package_done": 0,
         "current_file_name": None,
         "current_file_total": 0,
         "current_file_done": 0,
@@ -968,124 +1042,122 @@ async def process_confirmed_batch(batch_id: str, chat_id: int) -> None:
     job["auto_cancel_task"] = asyncio.create_task(auto_cancel_processing(job))
     active_jobs[job_id] = job
     batch["job_id"] = job_id
-    lock = processing_locks.setdefault(chat_id, asyncio.Lock())
     download_dir = FILES_DIR / batch_id
     zip_path = FILES_DIR / f"{batch_id}.zip"
     local_paths: List[str] = []
     password = generate_password()
     zip_name = safe_name(zip_path.name)
     try:
-        async with lock:
-            download_dir.mkdir(parents=True, exist_ok=True)
-            total_before = 0
-            for index, item in enumerate(batch["files"], start=1):
-                if job.get("cancelled"):
-                    raise asyncio.CancelledError()
-                source_message = item["message"]
-                dest_name = safe_name(item["file_name"])
-                target_path = download_dir / dest_name
-                local_path = await monitored_download(
-                    source_message,
-                    target_path,
-                    job,
-                    dest_name,
-                    index,
-                    batch["total_files"],
-                    total_before,
-                    item.get("url"),
-                )
-                local_paths.append(local_path)
-                total_before += item["file_size"]
-                cursor.execute(
-                    """
-                    UPDATE batch_items
-                    SET local_path = ?, status = 'downloaded'
-                    WHERE batch_id = ? AND telegram_message_id = ?
-                    """,
-                    (local_path, batch_id, item["message_id"]),
-                )
-                conn.commit()
-            if not local_paths:
-                raise RuntimeError("هیچ فایلی برای پردازش پیدا نشد")
-            files_for_zip = []
-            for i in range(len(batch["files"])):
-                files_for_zip.append(
-                    {
-                        "local_path": local_paths[i],
-                        "file_name": batch["files"][i]["file_name"],
-                        "file_size": batch["files"][i]["file_size"],
-                    }
-                )
-            await zip_files_with_progress(job, files_for_zip, zip_path, password)
+        download_dir.mkdir(parents=True, exist_ok=True)
+        total_before = 0
+        for index, item in enumerate(batch["files"], start=1):
             if job.get("cancelled"):
                 raise asyncio.CancelledError()
-            for item in batch["files"]:
-                cursor.execute(
-                    """
-                    UPDATE batch_items
-                    SET status = 'zipped'
-                    WHERE batch_id = ? AND telegram_message_id = ?
-                    """,
-                    (batch_id, item["message_id"]),
-                )
+            source_message = item["message"]
+            dest_name = safe_name(item["file_name"])
+            target_path = download_dir / dest_name
+            local_path = await monitored_download(
+                source_message,
+                target_path,
+                job,
+                dest_name,
+                index,
+                batch["total_files"],
+                total_before,
+                item.get("url"),
+            )
+            local_paths.append(local_path)
+            total_before += item["file_size"]
+            cursor.execute(
+                """
+                UPDATE batch_items
+                SET local_path = ?, status = 'downloaded'
+                WHERE batch_id = ? AND telegram_message_id = ?
+                """,
+                (local_path, batch_id, item["message_id"]),
+            )
             conn.commit()
+        if not local_paths:
+            raise RuntimeError("هیچ فایلی برای پردازش پیدا نشد")
+        files_for_zip = []
+        for i in range(len(batch["files"])):
+            files_for_zip.append(
+                {
+                    "local_path": local_paths[i],
+                    "file_name": batch["files"][i]["file_name"],
+                    "file_size": batch["files"][i]["file_size"],
+                }
+            )
+        await zip_files_with_progress(job, files_for_zip, zip_path, password)
+        if job.get("cancelled"):
+            raise asyncio.CancelledError()
+        for item in batch["files"]:
+            cursor.execute(
+                """
+                UPDATE batch_items
+                SET status = 'zipped'
+                WHERE batch_id = ? AND telegram_message_id = ?
+                """,
+                (batch_id, item["message_id"]),
+            )
+        conn.commit()
 
-            rubika_guid = batch.get("rubika_guid")
-            if not rubika_guid:
-                user = get_user(chat_id)
-                rubika_guid = user["rubika_guid"] if user else None
-            if not rubika_guid:
-                raise RuntimeError("اتصال روبیکا پیدا نشد")
+        rubika_guid = batch.get("rubika_guid")
+        if not rubika_guid:
+            user = get_user(chat_id)
+            rubika_guid = user["rubika_guid"] if user else None
+        if not rubika_guid:
+            raise RuntimeError("اتصال روبیکا پیدا نشد")
 
+        upload_success = False
+        upload_error = None
+        try:
+            await monitored_rubika_send(str(zip_path), zip_name, job, rubika_guid)
+            upload_success = True
+        except Exception as e:
+            upload_error = e
             upload_success = False
-            upload_error = None
-            try:
-                await monitored_rubika_send(str(zip_path), zip_name, job, rubika_guid)
-                upload_success = True
-            except Exception as e:
-                upload_error = e
-                upload_success = False
 
-            if upload_success:
-                set_batch_status(
-                    batch_id,
-                    "done",
-                    password=password,
-                    zip_name=zip_name,
-                    rubika_guid=rubika_guid,
-                )
-                await safe_edit(
-                    job["status_message"],
-                    "✅ عملیات با موفقیت به پایان رسید.",
-                    reply_markup=None,
-                )
-                await telegram_app.send_message(
-                    chat_id,
-                    f"✅ ارسال با موفقیت انجام شد\n\n🗂️ نام فایل:\n`{zip_name}`\n🔐 پسورد فایل:\n`{password}`",
-                )
-            else:
-                set_batch_status(
-                    batch_id,
-                    "upload_failed",
-                    password=password,
-                    zip_name=zip_name,
-                    rubika_guid=rubika_guid,
-                )
-                batch["upload_failed"] = True
-                batch["zip_name"] = zip_name
-                batch["password"] = password
-                batch["rubika_guid"] = rubika_guid
-                error_text = f"❌ خطا در آپلود به روبیکا یا اتمام زمان مجاز.\n\n{str(upload_error)[:500]}\n\n🔄 برای امتحان مجدد روی دکمه زیر کلیک کنید. (تا ۵ دقیقه اعتبار دارد)"
-                retry_markup = upload_retry_keyboard(batch_id)
-                retry_msg = await telegram_app.send_message(
-                    chat_id,
-                    error_text,
-                    reply_markup=retry_markup,
-                )
-                retry_timeout_task = asyncio.create_task(
-                    handle_upload_retry_timeout(batch_id, chat_id, retry_msg.id)
-                )
-                batch["retry_timeout_task"] = retry_timeout_task
+        if upload_success:
+            set_batch_status(
+                batch_id,
+                "done",
+                password=password,
+                zip_name=zip_name,
+                rubika_guid=rubika_guid,
+            )
+            await safe_edit(
+                job["status_message"],
+                "✅ عملیات با موفقیت به پایان رسید.",
+                reply_markup=None,
+            )
+            await telegram_app.send_message(
+                chat_id,
+                f"✅ ارسال با موفقیت انجام شد\n\n🗂️ نام فایل:\n`{zip_name}`\n🔐 پسورد فایل:\n`{password}`",
+            )
+        else:
+            set_batch_status(
+                batch_id,
+                "upload_failed",
+                password=password,
+                zip_name=zip_name,
+                rubika_guid=rubika_guid,
+            )
+            batch["upload_failed"] = True
+            batch["zip_name"] = zip_name
+            batch["password"] = password
+            batch["rubika_guid"] = rubika_guid
+            error_text = f"❌ خطا در آپلود به روبیکا یا اتمام زمان مجاز.\n\n{str(upload_error)[:500]}\n\n🔄 برای امتحان مجدد روی دکمه زیر کلیک کنید. (تا ۵ دقیقه اعتبار دارد)"
+            retry_markup = upload_retry_keyboard(batch_id)
+            retry_msg = await telegram_app.send_message(
+                chat_id,
+                error_text,
+                reply_markup=retry_markup,
+            )
+            retry_timeout_task = asyncio.create_task(
+                handle_upload_retry_timeout(batch_id, chat_id, retry_msg.id)
+            )
+            batch["retry_timeout_task"] = retry_timeout_task
     except asyncio.CancelledError:
         set_batch_status(batch_id, "cancelled")
         cursor.execute(
@@ -1110,6 +1182,11 @@ async def process_confirmed_batch(batch_id: str, chat_id: int) -> None:
                 f"❌ خطا در پردازش فایل\n\n{str(exc)[:500]}",
             )
     finally:
+        async with queue_lock:
+            with suppress(ValueError):
+                processing_queue.remove(batch_id)
+            running_batches.discard(batch_id)
+            running_users.discard(chat_id)
         auto_cancel_task = job.get("auto_cancel_task")
         if auto_cancel_task and not auto_cancel_task.done():
             auto_cancel_task.cancel()
@@ -1128,6 +1205,7 @@ async def process_confirmed_batch(batch_id: str, chat_id: int) -> None:
             "upload_failed", False
         ):
             active_batches.pop(batch_id, None)
+        await maybe_start_queued_batches()
 
 
 async def on_rubika_update(update):
@@ -1255,8 +1333,13 @@ async def on_callback_query(client, callback_query):
     if data.startswith("batch_cancel:"):
         batch_id = data.split(":", 1)[1]
         await safe_answer_callback(callback_query, "لغو شد")
-        batch = active_batches.pop(batch_id, None)
+        batch = active_batches.get(batch_id)
         if batch:
+            async with queue_lock:
+                with suppress(ValueError):
+                    processing_queue.remove(batch_id)
+                running_batches.discard(batch_id)
+                running_users.discard(int(batch["telegram_id"]))
             set_batch_status(batch_id, "cancelled")
             cursor.execute(
                 "UPDATE batch_items SET status = 'cancelled', local_path = NULL WHERE batch_id = ?",
@@ -1269,8 +1352,10 @@ async def on_callback_query(client, callback_query):
                 task.cancel()
             if batch.get("upload_failed"):
                 await cleanup_upload_failed(batch_id)
+            active_batches.pop(batch_id, None)
             with suppress(Exception):
                 await safe_edit(callback_query.message, "⛔ بسته لغو شد")
+            await maybe_start_queued_batches()
         return
 
     if data.startswith("batch_confirm:"):
@@ -1287,12 +1372,15 @@ async def on_callback_query(client, callback_query):
             )
             return
         batch["rubika_guid"] = user["rubika_guid"]
-        batch["status"] = "confirmed"
-        set_batch_status(batch_id, "confirmed", rubika_guid=user["rubika_guid"])
-        await safe_edit(callback_query.message, "⏳ فرایند آغاز شد...")
-        batch["processing_task"] = asyncio.create_task(
-            process_confirmed_batch(batch_id, callback_query.message.chat.id)
+        batch["status"] = "queued"
+        batch["queue_message"] = callback_query.message
+        set_batch_status(batch_id, "queued", rubika_guid=user["rubika_guid"])
+        position = await enqueue_batch(batch_id)
+        await safe_edit(
+            callback_query.message,
+            queue_status_text(position, len(processing_queue)),
         )
+        await maybe_start_queued_batches()
         return
 
     if data.startswith("job_cancel:"):
