@@ -8,11 +8,17 @@ import pyzipper
 import aiohttp
 from collections import deque
 from contextlib import suppress
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 from pyrogram import Client, filters as tg_filters
 from pyrogram.errors import FloodWait
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+)
 from rubpy import Client as RubikaClient
 from rubpy import handlers as rub_handlers
 from urllib.parse import urlparse, unquote
@@ -23,6 +29,7 @@ from config import (
     API_ID,
     AUTO_CANCEL_SECONDS,
     CHUNK_SIZE,
+    DAILY_FREE_QUOTA_BYTES,
     DB_PATH,
     FILES_DIR,
     MAX_UPLOAD_SIZE,
@@ -34,6 +41,7 @@ from config import (
     STATUS_EDIT_INTERVAL,
     TG_TOKEN,
     UPLOAD_TIMEOUT_SECONDS,
+    ADMIN_IDS,
 )
 from utils import (
     generate_auth_key,
@@ -54,7 +62,11 @@ cursor.executescript(
     CREATE TABLE IF NOT EXISTS users (
         telegram_id INTEGER PRIMARY KEY,
         auth_key TEXT,
-        rubika_guid TEXT
+        rubika_guid TEXT,
+        successful_uploads INTEGER DEFAULT 0,
+        daily_free_remaining INTEGER DEFAULT 0,
+        main_remaining INTEGER DEFAULT 0,
+        daily_reset_date TEXT
     );
 
     CREATE TABLE IF NOT EXISTS batches (
@@ -86,8 +98,22 @@ cursor.executescript(
         created_at INTEGER NOT NULL,
         status TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    );
     """
 )
+user_cols = {row["name"] for row in cursor.execute("PRAGMA table_info(users)").fetchall()}
+if "successful_uploads" not in user_cols:
+    cursor.execute("ALTER TABLE users ADD COLUMN successful_uploads INTEGER DEFAULT 0")
+if "daily_free_remaining" not in user_cols:
+    cursor.execute("ALTER TABLE users ADD COLUMN daily_free_remaining INTEGER DEFAULT 0")
+if "main_remaining" not in user_cols:
+    cursor.execute("ALTER TABLE users ADD COLUMN main_remaining INTEGER DEFAULT 0")
+if "daily_reset_date" not in user_cols:
+    cursor.execute("ALTER TABLE users ADD COLUMN daily_reset_date TEXT")
 conn.commit()
 
 loop = asyncio.new_event_loop()
@@ -112,6 +138,26 @@ processing_queue: deque[str] = deque()
 running_batches: set[str] = set()
 running_users: set[int] = set()
 retry_deadlines: Dict[str, Dict[str, int]] = {}
+admin_states: Dict[int, Dict[str, Any]] = {}
+
+
+def tehran_today() -> str:
+    return datetime.now(ZoneInfo("Asia/Tehran")).date().isoformat()
+
+
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [["📘 راهنما", "👤 حساب کاربری"]],
+        resize_keyboard=True,
+    )
+
+
+def quota_text(size: int) -> str:
+    value = max(int(size or 0), 0)
+    one_gb = 1024**3
+    if value >= one_gb:
+        return f"{value / one_gb:.2f} گیگابایت"
+    return mb_text(value)
 
 
 def get_reserved_bytes() -> int:
@@ -127,7 +173,11 @@ def get_available_bytes() -> int:
 
 def get_user(telegram_id: int) -> Optional[Dict[str, Any]]:
     row = cursor.execute(
-        "SELECT telegram_id, auth_key, rubika_guid FROM users WHERE telegram_id = ?",
+        """
+        SELECT telegram_id, auth_key, rubika_guid, successful_uploads,
+               daily_free_remaining, main_remaining, daily_reset_date
+        FROM users WHERE telegram_id = ?
+        """,
         (telegram_id,),
     ).fetchone()
     if not row:
@@ -136,27 +186,127 @@ def get_user(telegram_id: int) -> Optional[Dict[str, Any]]:
         "telegram_id": row["telegram_id"],
         "auth_key": row["auth_key"],
         "rubika_guid": row["rubika_guid"],
+        "successful_uploads": int(row["successful_uploads"] or 0),
+        "daily_free_remaining": int(row["daily_free_remaining"] or 0),
+        "main_remaining": int(row["main_remaining"] or 0),
+        "daily_reset_date": row["daily_reset_date"],
     }
 
 
 def upsert_user(
     telegram_id: int, auth_key: str, rubika_guid: Optional[str] = None
 ) -> None:
+    today = tehran_today()
     existing = get_user(telegram_id)
     keep_rubika_guid = existing["rubika_guid"] if existing else None
     if rubika_guid is not None:
         keep_rubika_guid = rubika_guid
+    successful_uploads = existing["successful_uploads"] if existing else 0
+    daily_free_remaining = (
+        existing["daily_free_remaining"] if existing else DAILY_FREE_QUOTA_BYTES
+    )
+    if existing and existing.get("daily_reset_date") != today:
+        daily_free_remaining = DAILY_FREE_QUOTA_BYTES
+    main_remaining = existing["main_remaining"] if existing else 0
     cursor.execute(
         """
-        INSERT INTO users (telegram_id, auth_key, rubika_guid)
-        VALUES (?, ?, ?)
+        INSERT INTO users
+        (telegram_id, auth_key, rubika_guid, successful_uploads, daily_free_remaining, main_remaining, daily_reset_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(telegram_id) DO UPDATE SET
             auth_key = excluded.auth_key,
-            rubika_guid = excluded.rubika_guid
+            rubika_guid = excluded.rubika_guid,
+            successful_uploads = excluded.successful_uploads,
+            daily_free_remaining = excluded.daily_free_remaining,
+            main_remaining = excluded.main_remaining,
+            daily_reset_date = excluded.daily_reset_date
         """,
-        (telegram_id, auth_key, keep_rubika_guid),
+        (
+            telegram_id,
+            auth_key,
+            keep_rubika_guid,
+            successful_uploads,
+            daily_free_remaining,
+            main_remaining,
+            today,
+        ),
     )
     conn.commit()
+
+
+def reset_daily_quotas_if_needed() -> None:
+    today = tehran_today()
+    row = cursor.execute(
+        "SELECT value FROM meta WHERE key = 'daily_reset_date'"
+    ).fetchone()
+    last_reset = row["value"] if row else None
+    if last_reset == today:
+        return
+    cursor.execute(
+        """
+        UPDATE users
+        SET daily_free_remaining = ?, daily_reset_date = ?
+        """,
+        (DAILY_FREE_QUOTA_BYTES, today),
+    )
+    cursor.execute(
+        """
+        INSERT INTO meta (key, value) VALUES ('daily_reset_date', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (today,),
+    )
+    conn.commit()
+
+
+def get_or_create_user(telegram_id: int) -> Dict[str, Any]:
+    reset_daily_quotas_if_needed()
+    user = get_user(telegram_id)
+    if user:
+        return user
+    key = generate_auth_key()
+    upsert_user(telegram_id, key, None)
+    return get_user(telegram_id) or {}
+
+
+def get_user_total_remaining(user: Dict[str, Any]) -> int:
+    return int(user.get("daily_free_remaining", 0) or 0) + int(
+        user.get("main_remaining", 0) or 0
+    )
+
+
+def consume_user_quota(telegram_id: int, amount: int) -> None:
+    if amount <= 0:
+        return
+    user = get_or_create_user(telegram_id)
+    daily = int(user.get("daily_free_remaining", 0) or 0)
+    main = int(user.get("main_remaining", 0) or 0)
+    use_daily = min(daily, amount)
+    remaining = amount - use_daily
+    use_main = min(main, remaining)
+    cursor.execute(
+        """
+        UPDATE users
+        SET daily_free_remaining = ?, main_remaining = ?, successful_uploads = successful_uploads + 1
+        WHERE telegram_id = ?
+        """,
+        (max(daily - use_daily, 0), max(main - use_main, 0), telegram_id),
+    )
+    conn.commit()
+
+
+def update_user_main_volume(telegram_id: int, amount_bytes: int) -> None:
+    user = get_or_create_user(telegram_id)
+    current = int(user.get("main_remaining", 0) or 0)
+    target = max(current + amount_bytes, 0)
+    cursor.execute(
+        "UPDATE users SET main_remaining = ? WHERE telegram_id = ?",
+        (target, telegram_id),
+    )
+    conn.commit()
+
+
+reset_daily_quotas_if_needed()
 
 
 def set_user_rubika_guid(telegram_id: int, rubika_guid: str) -> None:
@@ -405,6 +555,101 @@ def upload_retry_keyboard(batch_id: str) -> InlineKeyboardMarkup:
     )
 
 
+def admin_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🔎 جستجوی کاربر", callback_data="admin_search_user"),
+                InlineKeyboardButton("🧹 پاک‌سازی", callback_data="admin_cleanup_prompt"),
+            ]
+        ]
+    )
+
+
+def admin_user_manage_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "➖ کاهش حجم اصلی", callback_data=f"admin_volume_dec:{user_id}"
+                ),
+                InlineKeyboardButton(
+                    "➕ افزایش حجم اصلی", callback_data=f"admin_volume_inc:{user_id}"
+                ),
+            ],
+            [InlineKeyboardButton("⬅️ بازگشت به پنل", callback_data="admin_back_panel")],
+        ]
+    )
+
+
+def admin_cleanup_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("❌ لغو", callback_data="admin_cleanup_cancel"),
+                InlineKeyboardButton("✅ تایید پاک‌سازی", callback_data="admin_cleanup_confirm"),
+            ],
+            [InlineKeyboardButton("⬅️ بازگشت به پنل", callback_data="admin_back_panel")],
+        ]
+    )
+
+
+def user_account_text(user: Dict[str, Any]) -> str:
+    return (
+        "👤 حساب کاربری\n\n"
+        f"🆔 چت آیدی: `{user['telegram_id']}`\n"
+        f"✅ تعداد آپلود موفق کل: {int(user.get('successful_uploads', 0))}\n"
+        f"🎁 باقی مانده حجم رایگان روزانه: {quota_text(int(user.get('daily_free_remaining', 0)))}\n"
+        f"💼 باقی مانده حجم اصلی: {quota_text(int(user.get('main_remaining', 0)))}"
+    )
+
+
+def help_text() -> str:
+    return (
+        "📘 **راهنمای کامل ربات**\n\n"
+        "🔹 **کارایی ربات**\n"
+        "این ربات برای انتقال فایل از تلگرام به روبیکا طراحی شده است. شما فایل یا لینک را در تلگرام می‌فرستید و ربات پس از پردازش، آن را به حساب روبیکای متصل‌شده ارسال می‌کند.\n\n"
+        "🔹 **پشتیبانی از لینک مستقیم**\n"
+        "اگر لینک مستقیم (HTTP/HTTPS) ارسال کنید، ربات فایل را دانلود می‌کند و سپس به روبیکا می‌فرستد. این قابلیت برای زمانی که فایل روی سایت یا CDN قرار دارد بسیار کاربردی است.\n\n"
+        "🔹 **پشتیبانی از آپلود گروهی (چند فایل)**\n"
+        "می‌توانید چند فایل را پشت سر هم ارسال کنید تا در یک بسته جمع‌آوری و پردازش شوند. این کار مخصوصاً برای ارسال مجموعه‌ای از فایل‌ها سریع‌تر و مرتب‌تر است.\n\n"
+        "🔹 **فشرده‌سازی و رمزگذاری**\n"
+        "قبل از ارسال به روبیکا، فایل‌ها به صورت فشرده‌سازی‌شده و رمزدار آماده می‌شوند. به همین دلیل محدودیت نوع فایل بسیار کمتر است و انواع مختلف محتوا قابل ارسال هستند.\n\n"
+        "🔹 **حجم رایگان روزانه و حجم اصلی**\n"
+        "هر کاربر روزانه 100 مگابایت حجم رایگان دارد که هر روز ساعت 00:00 به وقت تهران ریست می‌شود. علاوه بر آن، حجم اصلی هم جداگانه برای کاربر قابل افزایش است.\n\n"
+        "🔹 **نحوه کسر حجم**\n"
+        "حجم فقط زمانی کم می‌شود که آپلود واقعاً با موفقیت به روبیکا انجام شده باشد. اگر آپلود ناموفق باشد، حجمی از کاربر کسر نمی‌شود.\n\n"
+        "🕒 **پیشنهاد زمان ارسال فایل‌های حجیم**\n"
+        "به خاطر خلوت‌تر بودن سرویس و کمتر بودن محدودیت‌ها، پیشنهاد می‌شود فایل‌های حجیم را بین ساعات ۳ تا ۸ صبح ارسال کنید."
+    )
+
+
+def admin_overview_text() -> str:
+    total_users = cursor.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+    total_uploads = cursor.execute(
+        "SELECT COALESCE(SUM(successful_uploads), 0) AS c FROM users"
+    ).fetchone()["c"]
+    queued = len(processing_queue)
+    free_disk = get_available_bytes()
+    return (
+        "🛠️ پنل ادمین\n\n"
+        f"👥 تعداد کل کاربران: {int(total_users)}\n"
+        f"📤 تعداد فایل‌های کل آپلود شده: {int(total_uploads)}\n"
+        f"⏳ افراد در صف: {queued}\n"
+        f"💽 حجم خالی کلی دیسک سرور: {human_size(free_disk)}"
+    )
+
+
+def admin_user_info_text(user: Dict[str, Any]) -> str:
+    return (
+        "👤 اطلاعات کاربر\n\n"
+        f"🆔 چت آیدی: `{user['telegram_id']}`\n"
+        f"✅ تعداد آپلود موفق کل: {int(user.get('successful_uploads', 0))}\n"
+        f"🎁 باقی مانده حجم رایگان روزانه: {quota_text(int(user.get('daily_free_remaining', 0)))}\n"
+        f"💼 باقی مانده حجم اصلی: {quota_text(int(user.get('main_remaining', 0)))}"
+    )
+
+
 async def safe_edit(message, text: str, reply_markup=None):
     try:
         return await message.edit_text(text, reply_markup=reply_markup)
@@ -450,7 +695,7 @@ def queue_status_text(position: int, total_queued: int) -> str:
         f"⚙️ ظرفیت پردازش همزمان: {MAX_CONCURRENT_PROCESSES}\n\n"
         "مراحل بعدی:\n"
         "1) دانلود فایل‌ها\n"
-        "2) فشرده‌سازی ZIP\n"
+        "2) فشرده‌سازی فایل‌ها\n"
         "3) آپلود به روبیکا"
     )
 
@@ -837,8 +1082,33 @@ async def cleanup_upload_failed(batch_id: str) -> None:
     conn.commit()
 
 
+async def admin_cleanup_server_files() -> Tuple[int, int]:
+    deleted_files = 0
+    freed_bytes = 0
+    FILES_DIR.mkdir(parents=True, exist_ok=True)
+    for item in FILES_DIR.glob("**/*"):
+        if not item.is_file():
+            continue
+        with suppress(Exception):
+            freed_bytes += int(item.stat().st_size)
+            item.unlink()
+            deleted_files += 1
+    for item in sorted(FILES_DIR.glob("**/*"), reverse=True):
+        if item.is_dir():
+            with suppress(Exception):
+                item.rmdir()
+    FILES_DIR.mkdir(parents=True, exist_ok=True)
+    cursor.execute("UPDATE disk_reservations SET status = 'released' WHERE status = 'active'")
+    cursor.execute(
+        "UPDATE batch_items SET local_path = NULL WHERE local_path IS NOT NULL"
+    )
+    conn.commit()
+    return deleted_files, freed_bytes
+
+
 async def cron_watchdog() -> None:
     while True:
+        reset_daily_quotas_if_needed()
         now = now_ts()
         for job_id, job in list(active_jobs.items()):
             deadline = int(job.get("auto_cancel_deadline", 0) or 0)
@@ -980,7 +1250,7 @@ async def finalize_collection(collection_key: str) -> None:
 
 
 async def queue_media_message(message) -> None:
-    user = get_user(message.chat.id)
+    user = get_or_create_user(message.chat.id)
     if not user or not user.get("rubika_guid"):
         await message.reply_text("🔐 ابتدا اتصال روبیکا را برقرار کنید.")
         return
@@ -1178,6 +1448,7 @@ async def process_confirmed_batch(batch_id: str, chat_id: int) -> None:
             upload_success = False
 
         if upload_success:
+            consume_user_quota(chat_id, int(batch["total_size"]))
             set_batch_status(
                 batch_id,
                 "done",
@@ -1313,20 +1584,25 @@ async def on_rubika_update(update):
 
 @telegram_app.on_message(tg_filters.command("start") & tg_filters.private)
 async def tg_start(client, message):
-    user = get_user(message.chat.id)
+    user = get_or_create_user(message.chat.id)
     key = generate_auth_key()
     upsert_user(message.chat.id, key, user["rubika_guid"] if user else None)
     available = get_available_bytes()
-    current_user = get_user(message.chat.id)
+    current_user = get_or_create_user(message.chat.id)
     if current_user and current_user.get("rubika_guid"):
         text = (
             f"✅ اتصال شما برقرار است\n\n"
             f"🤖 حساب روبیکا: `{current_user['rubika_guid']}`\n\n"
             f"📤 فایل‌ها یا لینک‌های مستقیم خود را ارسال کنید تا در این حساب دریافت شوند.\n\n"
             f"🧮 فضای خالی فعلی: {human_size(available)}\n\n"
-            f"🔌 برای قطع اتصال از دکمه زیر استفاده کنید."
+            f"🔌 برای قطع اتصال از دکمه زیر استفاده کنید.\n\n"
+            f"منو:"
         )
-        await message.reply_text(text, reply_markup=disconnect_keyboard())
+        await message.reply_text(
+            text,
+            reply_markup=disconnect_keyboard(),
+        )
+        await message.reply_text("منو:", reply_markup=main_menu_keyboard())
     else:
         text = (
             f"👋 خوش آمدید\n\n"
@@ -1334,7 +1610,75 @@ async def tg_start(client, message):
             f"🧮 فضای خالی فعلی: {human_size(available)}\n\n"
             f"📩 این کلید را برای `@acc1192` در روبیکا ارسال کنید."
         )
-        await message.reply_text(text)
+        await message.reply_text(text, reply_markup=main_menu_keyboard())
+
+
+@telegram_app.on_message(tg_filters.command("panel") & tg_filters.private)
+async def admin_panel_command(client, message):
+    if message.chat.id not in ADMIN_IDS:
+        return
+    reset_daily_quotas_if_needed()
+    await message.reply_text(
+        admin_overview_text(),
+        reply_markup=admin_panel_keyboard(),
+    )
+
+
+@telegram_app.on_message(tg_filters.text & tg_filters.private)
+async def on_private_text_menu(client, message):
+    text = (message.text or "").strip()
+    user_id = message.chat.id
+    if text == "👤 حساب کاربری":
+        user = get_or_create_user(user_id)
+        await message.reply_text(user_account_text(user), reply_markup=main_menu_keyboard())
+        return
+    if text == "📘 راهنما":
+        await message.reply_text(
+            help_text(),
+            reply_markup=main_menu_keyboard(),
+            parse_mode="markdown",
+        )
+        return
+
+    state = admin_states.get(user_id)
+    if user_id not in ADMIN_IDS or not state:
+        return
+    if state.get("action") == "await_user_search":
+        if not text.isdigit():
+            await message.reply_text("⚠️ لطفاً فقط چت آیدی عددی ارسال کنید.")
+            return
+        target_id = int(text)
+        target_user = get_user(target_id)
+        if not target_user:
+            await message.reply_text("❌ کاربر یافت نشد.")
+            return
+        admin_states.pop(user_id, None)
+        await message.reply_text(
+            admin_user_info_text(target_user),
+            reply_markup=admin_user_manage_keyboard(target_id),
+        )
+        return
+    if state.get("action") == "await_volume_change":
+        if not re.fullmatch(r"\d+(\.\d+)?", text):
+            await message.reply_text("⚠️ مقدار حجم را به مگابایت و عددی ارسال کنید.")
+            return
+        mb_value = float(text)
+        if mb_value <= 0:
+            await message.reply_text("⚠️ مقدار باید بزرگ‌تر از صفر باشد.")
+            return
+        delta = int(mb_value * 1024 * 1024)
+        if state.get("mode") == "dec":
+            delta = -delta
+        target_id = int(state["target_user_id"])
+        update_user_main_volume(target_id, delta)
+        target_user = get_or_create_user(target_id)
+        admin_states.pop(user_id, None)
+        await message.reply_text(
+            "✅ حجم اصلی کاربر با موفقیت به‌روزرسانی شد.\n\n"
+            + admin_user_info_text(target_user),
+            reply_markup=admin_user_manage_keyboard(target_id),
+        )
+        return
 
 
 @telegram_app.on_message(
@@ -1352,12 +1696,20 @@ async def tg_start(client, message):
     & tg_filters.private
 )
 async def on_media_message(client, message):
+    text = (message.text or "").strip()
+    if text in {"👤 حساب کاربری", "📘 راهنما"}:
+        return
+    if text.startswith("/panel"):
+        return
+    if message.chat.id in ADMIN_IDS and admin_states.get(message.chat.id):
+        return
     await queue_media_message(message)
 
 
 @telegram_app.on_callback_query()
 async def on_callback_query(client, callback_query):
     data = callback_query.data or ""
+    admin_id = callback_query.message.chat.id
 
     if data == "disconnect_prompt":
         await safe_answer_callback(callback_query)
@@ -1395,6 +1747,92 @@ async def on_callback_query(client, callback_query):
         await safe_edit(callback_query.message, "✅ اتصال روبیکا قطع شد")
         return
 
+    if data == "admin_search_user":
+        if admin_id not in ADMIN_IDS:
+            await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
+            return
+        await safe_answer_callback(callback_query)
+        admin_states[admin_id] = {"action": "await_user_search"}
+        await telegram_app.send_message(
+            admin_id,
+            "🔎 چت آیدی کاربر را ارسال کنید:",
+        )
+        return
+
+    if data == "admin_back_panel":
+        if admin_id not in ADMIN_IDS:
+            await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
+            return
+        admin_states.pop(admin_id, None)
+        await safe_answer_callback(callback_query)
+        await safe_edit(
+            callback_query.message,
+            admin_overview_text(),
+            reply_markup=admin_panel_keyboard(),
+        )
+        return
+
+    if data == "admin_cleanup_prompt":
+        if admin_id not in ADMIN_IDS:
+            await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
+            return
+        await safe_answer_callback(callback_query)
+        await safe_edit(
+            callback_query.message,
+            "⚠️ با تایید پاک‌سازی، تمام فایل‌های موقت روی سرور حذف می‌شوند و فضای دیسک آزاد می‌شود.\n\nآیا مطمئن هستید؟",
+            reply_markup=admin_cleanup_confirm_keyboard(),
+        )
+        return
+
+    if data == "admin_cleanup_cancel":
+        if admin_id not in ADMIN_IDS:
+            await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
+            return
+        await safe_answer_callback(callback_query, "لغو شد")
+        await safe_edit(
+            callback_query.message,
+            admin_overview_text(),
+            reply_markup=admin_panel_keyboard(),
+        )
+        return
+
+    if data == "admin_cleanup_confirm":
+        if admin_id not in ADMIN_IDS:
+            await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
+            return
+        await safe_answer_callback(callback_query)
+        deleted_files, freed_bytes = await admin_cleanup_server_files()
+        await safe_edit(
+            callback_query.message,
+            "✅ پاک‌سازی انجام شد.\n\n"
+            f"🗑️ تعداد فایل حذف‌شده: {deleted_files}\n"
+            f"💽 حجم آزادشده: {human_size(freed_bytes)}\n\n"
+            + admin_overview_text(),
+            reply_markup=admin_panel_keyboard(),
+        )
+        return
+
+    if data.startswith("admin_volume_inc:") or data.startswith("admin_volume_dec:"):
+        if admin_id not in ADMIN_IDS:
+            await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
+            return
+        mode = "inc" if data.startswith("admin_volume_inc:") else "dec"
+        target_id = int(data.split(":", 1)[1])
+        await safe_answer_callback(callback_query)
+        admin_states[admin_id] = {
+            "action": "await_volume_change",
+            "mode": mode,
+            "target_user_id": target_id,
+        }
+        await telegram_app.send_message(
+            admin_id,
+            (
+                f"{'➕' if mode == 'inc' else '➖'} مقدار حجم را به مگابایت ارسال کنید.\n"
+                "مثال: 250"
+            ),
+        )
+        return
+
     if data.startswith("batch_cancel:"):
         batch_id = data.split(":", 1)[1]
         await safe_answer_callback(callback_query, "لغو شد")
@@ -1430,10 +1868,19 @@ async def on_callback_query(client, callback_query):
         if not batch:
             await safe_edit(callback_query.message, "⚠️ این بسته دیگر در دسترس نیست")
             return
-        user = get_user(callback_query.message.chat.id)
+        user = get_or_create_user(callback_query.message.chat.id)
         if not user or not user.get("rubika_guid"):
             await safe_edit(
                 callback_query.message, "🔐 ابتدا اتصال روبیکا را برقرار کنید"
+            )
+            return
+        total_remaining = get_user_total_remaining(user)
+        if batch["total_size"] > total_remaining:
+            await safe_edit(
+                callback_query.message,
+                "⛔️ حجم کافی ندارید.\n\n"
+                f"🎁+💼 حجم قابل استفاده شما: {mb_text(total_remaining)}\n"
+                f"📦 حجم بسته: {mb_text(batch['total_size'])}",
             )
             return
         batch["rubika_guid"] = user["rubika_guid"]
@@ -1540,6 +1987,7 @@ async def on_callback_query(client, callback_query):
             await monitored_rubika_send(
                 zip_path_str, batch["zip_name"], None, batch["rubika_guid"]
             )
+            consume_user_quota(callback_query.message.chat.id, int(batch["total_size"]))
             set_batch_status(
                 batch_id,
                 "done",
