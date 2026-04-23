@@ -1,0 +1,1428 @@
+import asyncio
+import os
+import random
+import re
+import shutil
+import sqlite3
+import string
+import time
+import pyzipper
+import aiohttp
+from dotenv import load_dotenv
+from contextlib import suppress
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from pyrogram import Client, filters as tg_filters
+from pyrogram.errors import FloodWait
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from rubpy import Client as RubikaClient
+from rubpy import handlers as rub_handlers
+from urllib.parse import urlparse, unquote
+
+BASE_DIR = Path(__file__).resolve().parent
+CONF_DIR = BASE_DIR / "conf"
+SESSIONS_DIR = CONF_DIR / "sessions"
+FILES_DIR = CONF_DIR / "files"
+DB_PATH = CONF_DIR / "bot_database.sqlite3"
+
+load_dotenv(CONF_DIR / ".env")
+
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+TG_TOKEN = os.getenv("TG_TOKEN")
+RUBIKA_SESSION_NAME = str(SESSIONS_DIR / "rubika_session")
+
+AUTH_KEY_LENGTH = 64
+ZIP_PASSWORD_LENGTH = 32
+STATUS_EDIT_INTERVAL = 0.8
+ALBUM_COLLECT_DELAY = 1.2
+CHUNK_SIZE = 1024 * 1024
+MAX_UPLOAD_SIZE = int(1 * 1024 * 1024 * 1024)
+SERVER_DISK_GB_DEFAULT = 2.0
+SERVER_DISK_GB = float(os.getenv("SERVER_DISK_GB", SERVER_DISK_GB_DEFAULT))
+SERVER_DISK_BYTES = int(SERVER_DISK_GB * 1024 * 1024 * 1024)
+SPECIAL_CHARS = "!@#$%^&*()-_=+[]{};:,.?/"
+
+
+def ensure_dirs() -> None:
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    FILES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+ensure_dirs()
+
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+conn.row_factory = sqlite3.Row
+cursor = conn.cursor()
+cursor.executescript(
+    """
+    CREATE TABLE IF NOT EXISTS users (
+        telegram_id INTEGER PRIMARY KEY,
+        auth_key TEXT,
+        rubika_guid TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS batches (
+        batch_id TEXT PRIMARY KEY,
+        telegram_id INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        total_files INTEGER NOT NULL,
+        total_size INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        password TEXT,
+        zip_name TEXT,
+        rubika_guid TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS batch_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        batch_id TEXT NOT NULL,
+        telegram_message_id INTEGER NOT NULL,
+        file_name TEXT NOT NULL,
+        file_size INTEGER NOT NULL,
+        local_path TEXT,
+        status TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS disk_reservations (
+        batch_id TEXT PRIMARY KEY,
+        telegram_id INTEGER NOT NULL,
+        bytes INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        status TEXT NOT NULL
+    );
+    """
+)
+conn.commit()
+
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
+telegram_app = Client(
+    "telegram_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=TG_TOKEN,
+    workdir=str(SESSIONS_DIR),
+)
+
+rubika_app = RubikaClient(RUBIKA_SESSION_NAME, timeout=1800)
+
+pending_collections: Dict[str, Dict[str, Any]] = {}
+active_batches: Dict[str, Dict[str, Any]] = {}
+active_jobs: Dict[str, Dict[str, Any]] = {}
+processing_locks: Dict[int, asyncio.Lock] = {}
+db_lock = asyncio.Lock()
+
+
+def now_ts() -> int:
+    return int(time.time())
+
+
+def random_text(length: int) -> str:
+    return "".join(random.choices(string.ascii_letters + string.digits, k=length))
+
+
+def generate_auth_key() -> str:
+    return random_text(AUTH_KEY_LENGTH)
+
+
+def generate_password() -> str:
+    alphabet = string.ascii_letters + string.digits + SPECIAL_CHARS
+    rng = random.SystemRandom()
+    while True:
+        value = "".join(rng.choice(alphabet) for _ in range(ZIP_PASSWORD_LENGTH))
+        if any(ch in SPECIAL_CHARS for ch in value):
+            return value
+
+
+def safe_name(name: str, fallback: str = "file") -> str:
+    name = (name or "").strip().replace("\x00", "")
+    name = os.path.basename(name)
+    name = re.sub(r'[\\/:*?"<>|]+', "_", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name or fallback
+
+
+def human_size(size: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    n = float(max(size, 0))
+    for unit in units:
+        if n < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(n)} {unit}"
+            return f"{n:.2f} {unit}"
+        n /= 1024
+    return "0 B"
+
+
+def percent_text(done: int, total: int) -> str:
+    if not total:
+        return "0%"
+    return f"{(done / total) * 100:.1f}%"
+
+
+def get_reserved_bytes() -> int:
+    row = cursor.execute(
+        "SELECT COALESCE(SUM(bytes), 0) AS total FROM disk_reservations WHERE status = 'active'"
+    ).fetchone()
+    return int(row["total"] or 0)
+
+
+def get_available_bytes() -> int:
+    return max(SERVER_DISK_BYTES - get_reserved_bytes(), 0)
+
+
+def get_user(telegram_id: int) -> Optional[Dict[str, Any]]:
+    row = cursor.execute(
+        "SELECT telegram_id, auth_key, rubika_guid FROM users WHERE telegram_id = ?",
+        (telegram_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "telegram_id": row["telegram_id"],
+        "auth_key": row["auth_key"],
+        "rubika_guid": row["rubika_guid"],
+    }
+
+
+def upsert_user(
+    telegram_id: int, auth_key: str, rubika_guid: Optional[str] = None
+) -> None:
+    existing = get_user(telegram_id)
+    keep_rubika_guid = existing["rubika_guid"] if existing else None
+    if rubika_guid is not None:
+        keep_rubika_guid = rubika_guid
+    cursor.execute(
+        """
+        INSERT INTO users (telegram_id, auth_key, rubika_guid)
+        VALUES (?, ?, ?)
+        ON CONFLICT(telegram_id) DO UPDATE SET
+            auth_key = excluded.auth_key,
+            rubika_guid = excluded.rubika_guid
+        """,
+        (telegram_id, auth_key, keep_rubika_guid),
+    )
+    conn.commit()
+
+
+def set_user_rubika_guid(telegram_id: int, rubika_guid: str) -> None:
+    cursor.execute(
+        "UPDATE users SET rubika_guid = ? WHERE telegram_id = ?",
+        (rubika_guid, telegram_id),
+    )
+    conn.commit()
+
+
+def disconnect_user(telegram_id: int) -> None:
+    cursor.execute(
+        "UPDATE users SET rubika_guid = NULL WHERE telegram_id = ?",
+        (telegram_id,),
+    )
+    cursor.execute(
+        "UPDATE disk_reservations SET status = 'released' WHERE telegram_id = ? AND status = 'active'",
+        (telegram_id,),
+    )
+    cursor.execute(
+        "UPDATE batches SET status = 'released' WHERE telegram_id = ? AND status IN ('pending', 'confirmed', 'active')",
+        (telegram_id,),
+    )
+    conn.commit()
+
+
+def create_batch_record(
+    batch_id: str,
+    telegram_id: int,
+    total_files: int,
+    total_size: int,
+    status: str = "pending",
+) -> None:
+    cursor.execute(
+        """
+        INSERT INTO batches
+        (batch_id, telegram_id, created_at, total_files, total_size, status, password, zip_name, rubika_guid)
+        VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+        ON CONFLICT(batch_id) DO UPDATE SET
+            telegram_id = excluded.telegram_id,
+            created_at = excluded.created_at,
+            total_files = excluded.total_files,
+            total_size = excluded.total_size,
+            status = excluded.status
+        """,
+        (batch_id, telegram_id, now_ts(), total_files, total_size, status),
+    )
+    conn.commit()
+
+
+def set_batch_status(
+    batch_id: str,
+    status: str,
+    password: Optional[str] = None,
+    zip_name: Optional[str] = None,
+    rubika_guid: Optional[str] = None,
+) -> None:
+    fields = ["status = ?"]
+    params: List[Any] = [status]
+    if password is not None:
+        fields.append("password = ?")
+        params.append(password)
+    if zip_name is not None:
+        fields.append("zip_name = ?")
+        params.append(zip_name)
+    if rubika_guid is not None:
+        fields.append("rubika_guid = ?")
+        params.append(rubika_guid)
+    params.append(batch_id)
+    cursor.execute(f"UPDATE batches SET {', '.join(fields)} WHERE batch_id = ?", params)
+    conn.commit()
+
+
+async def reserve_space(
+    telegram_id: int, batch_id: str, bytes_needed: int
+) -> Tuple[bool, int]:
+    async with db_lock:
+        current_available = get_available_bytes()
+        if bytes_needed > current_available:
+            return False, current_available
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO disk_reservations (batch_id, telegram_id, bytes, created_at, status)
+            VALUES (?, ?, ?, ?, 'active')
+            """,
+            (batch_id, telegram_id, bytes_needed, now_ts()),
+        )
+        conn.commit()
+        return True, get_available_bytes()
+
+
+async def reduce_reservation(batch_id: str, amount: int) -> None:
+    async with db_lock:
+        cursor.execute(
+            "UPDATE disk_reservations SET bytes = MAX(0, bytes - ?) WHERE batch_id = ?",
+            (amount, batch_id),
+        )
+        conn.commit()
+
+
+async def release_space(batch_id: str, status: str = "released") -> None:
+    async with db_lock:
+        cursor.execute(
+            "UPDATE disk_reservations SET status = ? WHERE batch_id = ?",
+            (status, batch_id),
+        )
+        conn.commit()
+
+
+async def cleanup_paths(*paths: Optional[str]) -> None:
+    for path in paths:
+        if not path:
+            continue
+        with suppress(Exception):
+            p = Path(path)
+            if p.is_file():
+                p.unlink()
+            elif p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+
+
+def get_media_info(message) -> Optional[Dict[str, Any]]:
+    media = (
+        message.document
+        or message.video
+        or message.audio
+        or message.photo
+        or message.animation
+        or message.voice
+        or message.video_note
+        or message.sticker
+    )
+    if not media:
+        return None
+    file_size = int(getattr(media, "file_size", 0) or 0)
+    if message.document and getattr(message.document, "file_name", None):
+        file_name = message.document.file_name
+    elif message.video and getattr(message.video, "file_name", None):
+        file_name = message.video.file_name
+    elif message.audio and getattr(message.audio, "file_name", None):
+        file_name = message.audio.file_name
+    elif message.animation:
+        file_name = (
+            getattr(message.animation, "file_name", None)
+            or f"animation_{message.id}.mp4"
+        )
+    elif message.voice:
+        file_name = f"voice_{message.id}.ogg"
+    elif message.video_note:
+        file_name = f"video_note_{message.id}.mp4"
+    elif message.sticker:
+        is_animated = getattr(message.sticker, "is_animated", False) or getattr(
+            message.sticker, "is_video", False
+        )
+        ext = ".tgs" if is_animated else ".webp"
+        file_name = f"sticker_{message.id}{ext}"
+    elif message.photo:
+        file_name = f"photo_{message.id}.jpg"
+    else:
+        file_name = f"file_{message.id}.bin"
+    return {
+        "message_id": message.id,
+        "file_name": safe_name(file_name),
+        "file_size": file_size,
+        "message": message,
+    }
+
+
+def batch_key_for_message(message) -> str:
+    return f"chat:{message.chat.id}"
+
+
+def confirm_keyboard(batch_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "❌ لغو", callback_data=f"batch_cancel:{batch_id}"
+                ),
+                InlineKeyboardButton(
+                    "✅ تایید و شروع", callback_data=f"batch_confirm:{batch_id}"
+                ),
+            ]
+        ]
+    )
+
+
+def disconnect_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔌 قطع اتصال روبیکا", callback_data="disconnect_prompt"
+                )
+            ]
+        ]
+    )
+
+
+def disconnect_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("⬅️ لغو", callback_data="disconnect_cancel"),
+                InlineKeyboardButton(
+                    "✅ تایید قطع اتصال", callback_data="disconnect_confirm"
+                ),
+            ]
+        ]
+    )
+
+
+def progress_keyboard(job_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⛔ لغو فرایند", callback_data=f"job_cancel:{job_id}")]]
+    )
+
+
+def job_cancel_confirm_keyboard(job_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "⬅️ انصراف", callback_data=f"job_cancel_cancel:{job_id}"
+                ),
+                InlineKeyboardButton(
+                    "✅ تایید و لغو", callback_data=f"job_cancel_confirm:{job_id}"
+                ),
+            ]
+        ]
+    )
+
+
+def upload_retry_keyboard(batch_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔄 امتحان مجدد", callback_data=f"upload_retry:{batch_id}"
+                ),
+                InlineKeyboardButton(
+                    "❌ لغو", callback_data=f"batch_cancel:{batch_id}"
+                ),
+            ]
+        ]
+    )
+
+
+async def safe_edit(message, text: str, reply_markup=None):
+    try:
+        return await message.edit_text(text, reply_markup=reply_markup)
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        with suppress(Exception):
+            return await message.edit_text(text, reply_markup=reply_markup)
+    except Exception:
+        return message
+
+
+async def safe_answer_callback(
+    callback_query, text: Optional[str] = None, show_alert: bool = False
+):
+    with suppress(Exception):
+        await callback_query.answer(text or "", show_alert=show_alert)
+
+
+async def update_status(job: Dict[str, Any], stage: str, force: bool = False) -> None:
+    if "status_lock" not in job:
+        job["status_lock"] = asyncio.Lock()
+
+    async with job["status_lock"]:
+        if job.get("cancel_confirm_shown"):
+            return
+        if job.get("cancelled"):
+            raise asyncio.CancelledError()
+
+        if stage.startswith("☁️"):
+            text = f"{stage}\n💾 حجم کل: {human_size(job.get('total_size', 0))}"
+        else:
+            total_files = job.get("total_files", 0)
+            downloaded_files = job.get("downloaded_files", 0)
+            processed_files = job.get("processed_files", 0)
+            total_size = job.get("total_size", 0)
+            downloaded_bytes = job.get("downloaded_bytes", 0)
+            processed_bytes = job.get("processed_bytes", 0)
+            current_file_name = job.get("current_file_name")
+            current_file_done = job.get("current_file_done", 0)
+            current_file_total = job.get("current_file_total", 0)
+            lines = [stage]
+
+            if total_files:
+                if stage.startswith("📥"):
+                    lines.append(f"📦 فایل‌ها: {downloaded_files}/{total_files}")
+                    lines.append(
+                        f"💾 حجم کل: {human_size(downloaded_bytes)} / {human_size(total_size)}"
+                    )
+                    lines.append(
+                        f"📊 پیشرفت کل: {percent_text(downloaded_bytes, total_size)}"
+                    )
+                    if job.get("download_speed"):
+                        lines.append(f"📈 سرعت دانلود: {job['download_speed']} MB/s")
+                elif stage.startswith("🗜️"):
+                    lines.append(f"📦 فایل‌ها: {processed_files}/{total_files}")
+                    lines.append(
+                        f"💾 حجم کل: {human_size(processed_bytes)} / {human_size(total_size)}"
+                    )
+                    lines.append(
+                        f"📊 پیشرفت کل: {percent_text(processed_bytes, total_size)}"
+                    )
+
+            if current_file_name:
+                lines.append(f"📄 فایل فعلی: {current_file_name}")
+                if current_file_total:
+                    lines.append(
+                        f"↳ {human_size(current_file_done)} / {human_size(current_file_total)}"
+                    )
+                    lines.append(
+                        f"↳ پیشرفت فایل: {percent_text(current_file_done, current_file_total)}"
+                    )
+            text = "\n".join(lines)
+
+        now = time.monotonic()
+        if (
+            not force
+            and text == job.get("last_text")
+            and now - job.get("last_edit", 0) < STATUS_EDIT_INTERVAL
+        ):
+            return
+        if not force and now - job.get("last_edit", 0) < STATUS_EDIT_INTERVAL:
+            return
+
+        job["status_message"] = await safe_edit(
+            job["status_message"],
+            text,
+            reply_markup=progress_keyboard(job["job_id"]),
+        )
+        job["last_text"] = text
+        job["last_edit"] = now
+
+
+async def monitored_download(
+    message,
+    target_path: Path,
+    job: Dict[str, Any],
+    file_name: str,
+    file_index: int,
+    file_count: int,
+    total_before: int,
+    url: Optional[str] = None,
+) -> str:
+    total = 0
+    if not url:
+        media = (
+            message.document
+            or message.video
+            or message.audio
+            or message.photo
+            or message.animation
+            or message.voice
+            or message.video_note
+            or message.sticker
+        )
+        total = int(getattr(media, "file_size", 0) or 0)
+
+    job["current_file_name"] = file_name
+    job["current_file_total"] = total
+    job["current_file_done"] = 0
+    job["downloaded_files"] = file_index - 1
+    job["downloaded_bytes"] = total_before
+    job["download_speed"] = "0.0"
+    await update_status(job, "📥 در حال دانلود...", force=True)
+
+    last_percent = -1
+    last_time = time.monotonic()
+    last_bytes = 0
+
+    async def progress(current: int, total_bytes: int):
+        nonlocal last_percent, last_time, last_bytes
+        if job.get("cancelled"):
+            raise asyncio.CancelledError()
+        total_value = int(total_bytes or total or 0)
+        current_value = int(current or 0)
+        percent = int((current_value / total_value) * 100) if total_value else 0
+        now = time.monotonic()
+        if (
+            current_value == total_value
+            or percent != last_percent
+            or now - last_time >= 1.0
+        ):
+            delta_time = now - last_time
+            delta_bytes = current_value - last_bytes
+            if delta_time > 0:
+                speed = delta_bytes / delta_time / (1024**2)
+                job["download_speed"] = f"{speed:.1f}"
+            else:
+                job["download_speed"] = "0.0"
+            last_percent = percent
+            last_bytes = current_value
+            last_time = now
+            job["current_file_done"] = current_value
+            job["current_file_total"] = total_value
+            job["downloaded_bytes"] = total_before + current_value
+            job["downloaded_files"] = (
+                file_index - 1 + (1 if current_value == total_value else 0)
+            )
+            await update_status(job, "📥 در حال دانلود...")
+
+    if url:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                total = int(resp.headers.get("Content-Length", total) or total)
+                job["current_file_total"] = total
+                current_value = 0
+                with open(target_path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
+                        if job.get("cancelled"):
+                            raise asyncio.CancelledError()
+                        f.write(chunk)
+                        current_value += len(chunk)
+                        await progress(current_value, total)
+    else:
+        path = await message.download(file_name=str(target_path), progress=progress)
+
+    if job.get("cancelled"):
+        raise asyncio.CancelledError()
+    job["downloaded_bytes"] = total_before + total
+    job["downloaded_files"] = file_index
+    job["current_file_done"] = total
+    job["current_file_total"] = total
+    job["download_speed"] = "0.0"
+    await update_status(job, "📥 در حال دانلود...", force=True)
+    return str(target_path)
+
+
+async def zip_files_with_progress(
+    job: Dict[str, Any],
+    files: List[Dict[str, Any]],
+    zip_path: Path,
+    password: str,
+) -> str:
+    total_size = sum(item["file_size"] for item in files)
+    processed = 0
+    job["processed_files"] = 0
+    job["processed_bytes"] = 0
+    job["current_file_name"] = None
+    await update_status(job, "🗜️ در حال فشرده‌سازی...", force=True)
+    last_time = time.monotonic()
+    with pyzipper.AESZipFile(
+        zip_path,
+        "w",
+        compression=pyzipper.ZIP_DEFLATED,
+        encryption=pyzipper.WZ_AES,
+    ) as zf:
+        zf.setpassword(password.encode())
+        for index, item in enumerate(files, start=1):
+            if job.get("cancelled"):
+                raise asyncio.CancelledError()
+            source_path = item["local_path"]
+            arcname = item["file_name"]
+            file_size = item["file_size"]
+            current_done = 0
+            job["current_file_name"] = arcname
+            job["current_file_total"] = file_size
+            job["current_file_done"] = 0
+            await update_status(job, "🗜️ در حال فشرده‌سازی...")
+            with open(source_path, "rb") as src, zf.open(arcname, "w") as dest:
+                while True:
+                    if job.get("cancelled"):
+                        raise asyncio.CancelledError()
+                    chunk = src.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    dest.write(chunk)
+                    current_done += len(chunk)
+                    processed += len(chunk)
+                    await asyncio.sleep(0)
+                    now = time.monotonic()
+                    if current_done == file_size or now - last_time >= 1.0:
+                        last_time = now
+                        job["processed_bytes"] = processed
+                        job["processed_files"] = (
+                            index - 1 + (1 if current_done >= file_size else 0)
+                        )
+                        job["current_file_done"] = current_done
+                        job["current_file_total"] = file_size
+                        await update_status(job, "🗜️ در حال فشرده‌سازی...")
+            with suppress(Exception):
+                os.remove(source_path)
+            await reduce_reservation(job["batch_id"], file_size)
+
+    job["processed_bytes"] = total_size
+    job["processed_files"] = len(files)
+    await update_status(job, "🗜️ فشرده‌سازی کامل شد", force=True)
+    return str(zip_path)
+
+
+async def monitored_rubika_send(
+    file_path: str,
+    file_name: str,
+    job: Optional[Dict[str, Any]],
+    rubika_guid: str,
+) -> Any:
+    size = os.path.getsize(file_path)
+    if job is not None:
+        job["uploaded_bytes"] = 0
+        job["uploaded_files"] = 0
+        await update_status(job, "☁️ در حال آپلود به روبیکا...", force=True)
+
+    sent = None
+    try:
+        sent = await asyncio.wait_for(
+            rubika_app.send_document(
+                object_guid=rubika_guid,
+                document=file_path,
+                caption=file_name,
+            ),
+            timeout=1800,
+        )
+    except asyncio.TimeoutError:
+        raise TimeoutError("Timeout30")
+    except Exception as e1:
+        try:
+            sent = await asyncio.wait_for(
+                rubika_app.send_message(
+                    object_guid=rubika_guid,
+                    text=file_name,
+                    file_inline=file_path,
+                    type="File",
+                ),
+                timeout=1800,
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError("Timeout30")
+        except Exception as e2:
+            raise RuntimeError(f"خطا در ارسال به روبیکا: {e1} | {e2}")
+
+    if job is not None and job.get("cancelled"):
+        raise asyncio.CancelledError()
+
+    if job is not None:
+        job["uploaded_bytes"] = size
+        job["uploaded_files"] = 1
+        await update_status(job, "☁️ آپلود به روبیکا کامل شد", force=True)
+    return sent
+
+
+async def cleanup_upload_failed(batch_id: str) -> None:
+    download_dir = FILES_DIR / batch_id
+    zip_path = FILES_DIR / f"{batch_id}.zip"
+    await cleanup_paths(str(zip_path))
+    await cleanup_paths(str(download_dir))
+
+
+async def handle_upload_retry_timeout(
+    batch_id: str, chat_id: int, retry_msg_id: int
+) -> None:
+    await asyncio.sleep(300)
+    if batch_id not in active_batches or not active_batches[batch_id].get(
+        "upload_failed", False
+    ):
+        return
+    batch = active_batches[batch_id]
+    try:
+        await telegram_app.edit_message_text(
+            chat_id=chat_id,
+            message_id=retry_msg_id,
+            text="⏰ زمان درخواست امتحان مجدد به پایان رسید.\nفرایند به طور خودکار لغو شد.",
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+    set_batch_status(batch_id, "cancelled")
+    await cleanup_upload_failed(batch_id)
+    active_batches.pop(batch_id, None)
+
+
+def get_rubika_chat_guid(update) -> Optional[str]:
+    candidates = [
+        getattr(update, "object_guid", None),
+        getattr(update, "chat_guid", None),
+        getattr(update, "chat_id", None),
+        getattr(update, "guid", None),
+    ]
+    new_message = getattr(update, "new_message", None)
+    if new_message is not None:
+        candidates.extend(
+            [
+                getattr(new_message, "object_guid", None),
+                getattr(new_message, "chat_guid", None),
+                getattr(new_message, "chat_id", None),
+                getattr(new_message, "guid", None),
+                getattr(new_message, "author_object_guid", None),
+            ]
+        )
+    for candidate in candidates:
+        if candidate:
+            return str(candidate)
+    return None
+
+
+def get_rubika_text(update) -> str:
+    new_message = getattr(update, "new_message", None)
+    if new_message is not None:
+        for attr in ("text", "message", "caption"):
+            value = getattr(new_message, attr, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    for attr in ("text", "message", "caption"):
+        value = getattr(update, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+async def rubika_reply(update, text: str):
+    reply = getattr(update, "reply", None)
+    if callable(reply):
+        try:
+            return await reply(text)
+        except Exception:
+            pass
+    chat_guid = get_rubika_chat_guid(update)
+    if chat_guid:
+        return await rubika_app.send_message(object_guid=chat_guid, text=text)
+    return None
+
+
+async def create_confirmation_prompt(chat_id: int, batch: Dict[str, Any]) -> None:
+    available = get_available_bytes()
+    file_lines = [
+        f"• {item['file_name']} — {human_size(item['file_size'])}"
+        for item in batch["files"]
+    ]
+    details = "\n".join(file_lines[:10])
+    if len(file_lines) > 10:
+        details += f"\n• و {len(file_lines) - 10} فایل دیگر"
+    text = (
+        f"📦 بسته آماده شد\n\n"
+        f"🔢 تعداد فایل‌ها: {batch['total_files']}\n"
+        f"💾 حجم کل: {human_size(batch['total_size'])}\n"
+        f"🧮 فضای خالی فعلی: {human_size(available)}\n\n"
+        f"{details}\n\n"
+        f"✅ با تایید، همه فایل‌ها در یک فایل ZIP فشرده و ارسال می‌شوند."
+    )
+    msg = await telegram_app.send_message(
+        chat_id,
+        text,
+        reply_markup=confirm_keyboard(batch["batch_id"]),
+    )
+    batch["prompt_message_id"] = msg.id
+    active_batches[batch["batch_id"]] = batch
+
+
+async def finalize_collection(collection_key: str) -> None:
+    await asyncio.sleep(ALBUM_COLLECT_DELAY)
+    batch = pending_collections.pop(collection_key, None)
+    if not batch:
+        return
+    total_size = sum(item["file_size"] for item in batch["files"])
+    total_files = len(batch["files"])
+    if total_files == 0:
+        return
+    batch_id = random_text(20)
+    batch["batch_id"] = batch_id
+    batch["total_size"] = total_size
+    batch["total_files"] = total_files
+    batch["status"] = "pending"
+    create_batch_record(
+        batch_id, batch["telegram_id"], total_files, total_size, "pending"
+    )
+    for item in batch["files"]:
+        cursor.execute(
+            """
+            INSERT INTO batch_items
+            (batch_id, telegram_message_id, file_name, file_size, local_path, status)
+            VALUES (?, ?, ?, ?, NULL, 'pending')
+            """,
+            (batch_id, item["message_id"], item["file_name"], item["file_size"]),
+        )
+    conn.commit()
+    await create_confirmation_prompt(batch["chat_id"], batch)
+
+
+async def queue_media_message(message) -> None:
+    user = get_user(message.chat.id)
+    if not user or not user.get("rubika_guid"):
+        await message.reply_text("🔐 ابتدا اتصال روبیکا را برقرار کنید.")
+        return
+
+    media = None
+    if message.text:
+        urls = re.findall(r"(https?://[^\s]+)", message.text)
+        if urls:
+            url = urls[0]
+            msg = await message.reply_text("🔍 در حال بررسی لینک...")
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.head(url, allow_redirects=True) as resp:
+                        size = int(resp.headers.get("Content-Length", 0))
+                        filename = "downloaded_file"
+                        cd = resp.headers.get("Content-Disposition")
+                        if cd and "filename=" in cd:
+                            filename = cd.split("filename=")[1].strip("\"'")
+                        else:
+                            parsed = urlparse(str(resp.url))
+                            name = Path(unquote(parsed.path)).name
+                            if name:
+                                filename = name
+                        media = {
+                            "message_id": message.id,
+                            "file_name": safe_name(filename),
+                            "file_size": size,
+                            "url": url,
+                            "message": message,
+                        }
+            except Exception:
+                await msg.edit_text("❌ خطا در بررسی لینک.")
+                return
+            await msg.delete()
+        else:
+            return
+    else:
+        media = get_media_info(message)
+
+    if not media:
+        return
+    if media["file_size"] > MAX_UPLOAD_SIZE:
+        await message.reply_text("📛 حجم هر آپلود نباید بیشتر از 1 گیگابایت باشد.")
+        return
+    collection_key = batch_key_for_message(message)
+    batch = pending_collections.get(collection_key)
+    if not batch:
+        batch = {
+            "telegram_id": message.chat.id,
+            "chat_id": message.chat.id,
+            "files": [],
+        }
+        pending_collections[collection_key] = batch
+    task = batch.get("task")
+    if task and not task.done():
+        task.cancel()
+    batch["files"].append(media)
+    batch["task"] = asyncio.create_task(finalize_collection(collection_key))
+
+
+async def process_confirmed_batch(batch_id: str, chat_id: int) -> None:
+    batch = active_batches.get(batch_id)
+    if not batch:
+        return
+    if batch.get("status") in {"active", "done"}:
+        return
+    if batch["total_size"] > MAX_UPLOAD_SIZE:
+        await telegram_app.send_message(
+            chat_id, "📛 حجم کل این بسته بیشتر از 1 گیگابایت است."
+        )
+        return
+    ok, available = await reserve_space(chat_id, batch_id, batch["total_size"] * 2)
+    if not ok:
+        await telegram_app.send_message(
+            chat_id,
+            f"⛔️ فضای کافی فعلا نداریم.\n\nفضای خالی: {human_size(available)}\nحجم موردنیاز: {human_size(batch['total_size'] * 2)}",
+        )
+        return
+    batch["status"] = "active"
+    set_batch_status(batch_id, "active")
+    job_id = random_text(18)
+    status_message = await telegram_app.send_message(
+        chat_id,
+        "⏳ در حال آماده‌سازی...",
+        reply_markup=progress_keyboard(job_id),
+    )
+    job = {
+        "job_id": job_id,
+        "batch_id": batch_id,
+        "telegram_id": chat_id,
+        "status_message": status_message,
+        "status_lock": asyncio.Lock(),
+        "cancelled": False,
+        "last_text": None,
+        "last_edit": 0,
+        "total_size": batch["total_size"],
+        "total_files": batch["total_files"],
+        "downloaded_files": 0,
+        "downloaded_bytes": 0,
+        "processed_files": 0,
+        "processed_bytes": 0,
+        "uploaded_files": 0,
+        "uploaded_bytes": 0,
+        "current_file_name": None,
+        "current_file_total": 0,
+        "current_file_done": 0,
+        "cancel_confirm_shown": False,
+        "task": asyncio.current_task(),
+    }
+    active_jobs[job_id] = job
+    batch["job_id"] = job_id
+    lock = processing_locks.setdefault(chat_id, asyncio.Lock())
+    download_dir = FILES_DIR / batch_id
+    zip_path = FILES_DIR / f"{batch_id}.zip"
+    local_paths: List[str] = []
+    password = generate_password()
+    zip_name = safe_name(zip_path.name)
+    try:
+        async with lock:
+            download_dir.mkdir(parents=True, exist_ok=True)
+            total_before = 0
+            for index, item in enumerate(batch["files"], start=1):
+                if job.get("cancelled"):
+                    raise asyncio.CancelledError()
+                source_message = item["message"]
+                dest_name = safe_name(item["file_name"])
+                target_path = download_dir / dest_name
+                local_path = await monitored_download(
+                    source_message,
+                    target_path,
+                    job,
+                    dest_name,
+                    index,
+                    batch["total_files"],
+                    total_before,
+                    item.get("url"),
+                )
+                local_paths.append(local_path)
+                total_before += item["file_size"]
+                cursor.execute(
+                    """
+                    UPDATE batch_items
+                    SET local_path = ?, status = 'downloaded'
+                    WHERE batch_id = ? AND telegram_message_id = ?
+                    """,
+                    (local_path, batch_id, item["message_id"]),
+                )
+                conn.commit()
+            if not local_paths:
+                raise RuntimeError("هیچ فایلی برای پردازش پیدا نشد")
+            files_for_zip = []
+            for i in range(len(batch["files"])):
+                files_for_zip.append(
+                    {
+                        "local_path": local_paths[i],
+                        "file_name": batch["files"][i]["file_name"],
+                        "file_size": batch["files"][i]["file_size"],
+                    }
+                )
+            await zip_files_with_progress(job, files_for_zip, zip_path, password)
+            if job.get("cancelled"):
+                raise asyncio.CancelledError()
+            for item in batch["files"]:
+                cursor.execute(
+                    """
+                    UPDATE batch_items
+                    SET status = 'zipped'
+                    WHERE batch_id = ? AND telegram_message_id = ?
+                    """,
+                    (batch_id, item["message_id"]),
+                )
+            conn.commit()
+
+            rubika_guid = batch.get("rubika_guid")
+            if not rubika_guid:
+                user = get_user(chat_id)
+                rubika_guid = user["rubika_guid"] if user else None
+            if not rubika_guid:
+                raise RuntimeError("اتصال روبیکا پیدا نشد")
+
+            upload_success = False
+            upload_error = None
+            try:
+                await monitored_rubika_send(str(zip_path), zip_name, job, rubika_guid)
+                upload_success = True
+            except Exception as e:
+                upload_error = e
+                upload_success = False
+
+            if upload_success:
+                set_batch_status(
+                    batch_id,
+                    "done",
+                    password=password,
+                    zip_name=zip_name,
+                    rubika_guid=rubika_guid,
+                )
+                await safe_edit(
+                    job["status_message"],
+                    "✅ عملیات با موفقیت به پایان رسید.",
+                    reply_markup=None,
+                )
+                await telegram_app.send_message(
+                    chat_id,
+                    f"✅ ارسال با موفقیت انجام شد\n\n🗂️ نام فایل:\n`{zip_name}`\n🔐 پسورد فایل:\n`{password}`",
+                )
+            else:
+                set_batch_status(
+                    batch_id,
+                    "upload_failed",
+                    password=password,
+                    zip_name=zip_name,
+                    rubika_guid=rubika_guid,
+                )
+                batch["upload_failed"] = True
+                batch["zip_name"] = zip_name
+                batch["password"] = password
+                batch["rubika_guid"] = rubika_guid
+                error_text = f"❌ خطا در آپلود به روبیکا یا اتمام زمان مجاز.\n\n{str(upload_error)[:500]}\n\n🔄 برای امتحان مجدد روی دکمه زیر کلیک کنید. (تا ۵ دقیقه اعتبار دارد)"
+                retry_markup = upload_retry_keyboard(batch_id)
+                retry_msg = await telegram_app.send_message(
+                    chat_id,
+                    error_text,
+                    reply_markup=retry_markup,
+                )
+                retry_timeout_task = asyncio.create_task(
+                    handle_upload_retry_timeout(batch_id, chat_id, retry_msg.id)
+                )
+                batch["retry_timeout_task"] = retry_timeout_task
+    except asyncio.CancelledError:
+        set_batch_status(batch_id, "cancelled")
+        with suppress(Exception):
+            await safe_edit(
+                job["status_message"], "⛔ فرایند لغو شد", reply_markup=None
+            )
+    except Exception as exc:
+        set_batch_status(batch_id, "failed")
+        with suppress(Exception):
+            await telegram_app.send_message(
+                chat_id,
+                f"❌ خطا در پردازش فایل\n\n{str(exc)[:500]}",
+            )
+    finally:
+        await release_space(batch_id, status="released")
+        should_cleanup = True
+        if batch_id in active_batches and active_batches[batch_id].get(
+            "upload_failed", False
+        ):
+            should_cleanup = False
+        if should_cleanup:
+            await cleanup_paths(*local_paths)
+            await cleanup_paths(str(zip_path))
+            await cleanup_paths(str(download_dir))
+        active_jobs.pop(job_id, None)
+        if batch_id in active_batches and not active_batches[batch_id].get(
+            "upload_failed", False
+        ):
+            active_batches.pop(batch_id, None)
+
+
+async def on_rubika_update(update):
+    text = get_rubika_text(update)
+    chat_guid = get_rubika_chat_guid(update)
+    if not chat_guid:
+        return
+    if text in {"/start", "start", "/help"}:
+        linked = cursor.execute(
+            "SELECT telegram_id FROM users WHERE rubika_guid = ? LIMIT 1",
+            (chat_guid,),
+        ).fetchone()
+        if linked:
+            await rubika_reply(update, "✅ اتصال فعال است")
+        return
+    if len(text) != AUTH_KEY_LENGTH:
+        return
+    linked = cursor.execute(
+        "SELECT telegram_id FROM users WHERE rubika_guid = ? LIMIT 1",
+        (chat_guid,),
+    ).fetchone()
+    if linked:
+        await rubika_reply(update, "✅ از قبل ثبت شده")
+        return
+    row = cursor.execute(
+        "SELECT telegram_id FROM users WHERE auth_key = ?",
+        (text,),
+    ).fetchone()
+    if row:
+        telegram_id = row["telegram_id"]
+        set_user_rubika_guid(telegram_id, chat_guid)
+        await rubika_reply(update, "✅ اتصال برقرار شد")
+        await telegram_app.send_message(
+            telegram_id,
+            f"✅ اتصال روبیکا برقرار شد\n\n🤖 حساب متصل: `{chat_guid}`\n\n📤 فایل یا لینک مستقیم خود را ارسال کنید.",
+        )
+    else:
+        await rubika_reply(update, "❌ کلید نامعتبر است")
+
+
+@telegram_app.on_message(tg_filters.command("start") & tg_filters.private)
+async def tg_start(client, message):
+    user = get_user(message.chat.id)
+    key = generate_auth_key()
+    upsert_user(message.chat.id, key, user["rubika_guid"] if user else None)
+    available = get_available_bytes()
+    current_user = get_user(message.chat.id)
+    if current_user and current_user.get("rubika_guid"):
+        text = (
+            f"✅ اتصال شما برقرار است\n\n"
+            f"🤖 حساب روبیکا: `{current_user['rubika_guid']}`\n\n"
+            f"📤 فایل‌ها یا لینک‌های مستقیم خود را ارسال کنید تا در این حساب دریافت شوند.\n\n"
+            f"🧮 فضای خالی فعلی: {human_size(available)}\n\n"
+            f"🔌 برای قطع اتصال از دکمه زیر استفاده کنید."
+        )
+        await message.reply_text(text, reply_markup=disconnect_keyboard())
+    else:
+        text = (
+            f"👋 خوش آمدید\n\n"
+            f"🔑 کلید دسترسی شما:\n`{key}`\n\n"
+            f"🧮 فضای خالی فعلی: {human_size(available)}\n\n"
+            f"📩 این کلید را برای `@acc1192` در روبیکا ارسال کنید."
+        )
+        await message.reply_text(text)
+
+
+@telegram_app.on_message(
+    (
+        tg_filters.document
+        | tg_filters.video
+        | tg_filters.audio
+        | tg_filters.photo
+        | tg_filters.animation
+        | tg_filters.voice
+        | tg_filters.video_note
+        | tg_filters.sticker
+        | tg_filters.text
+    )
+    & tg_filters.private
+)
+async def on_media_message(client, message):
+    await queue_media_message(message)
+
+
+@telegram_app.on_callback_query()
+async def on_callback_query(client, callback_query):
+    data = callback_query.data or ""
+
+    if data == "disconnect_prompt":
+        await safe_answer_callback(callback_query)
+        await safe_edit(
+            callback_query.message,
+            "⚠️ مطمئن هستید می‌خواهید اتصال روبیکا را قطع کنید؟",
+            reply_markup=disconnect_confirm_keyboard(),
+        )
+        return
+
+    if data == "disconnect_cancel":
+        await safe_answer_callback(callback_query)
+        user = get_user(callback_query.message.chat.id)
+        if user and user.get("rubika_guid"):
+            available = get_available_bytes()
+            text = (
+                f"✅ اتصال شما برقرار است\n\n"
+                f"🤖 حساب روبیکا: `{user['rubika_guid']}`\n\n"
+                f"📤 فایل‌ها یا لینک‌های مستقیم خود را ارسال کنید تا در این حساب دریافت شوند.\n\n"
+                f"🧮 فضای خالی فعلی: {human_size(available)}\n\n"
+                f"🔌 برای قطع اتصال از دکمه زیر استفاده کنید."
+            )
+            await safe_edit(
+                callback_query.message,
+                text,
+                reply_markup=disconnect_keyboard(),
+            )
+        else:
+            await safe_edit(callback_query.message, "🔒 هیچ اتصالی فعال نیست")
+        return
+
+    if data == "disconnect_confirm":
+        await safe_answer_callback(callback_query)
+        disconnect_user(callback_query.message.chat.id)
+        await safe_edit(callback_query.message, "✅ اتصال روبیکا قطع شد")
+        return
+
+    if data.startswith("batch_cancel:"):
+        batch_id = data.split(":", 1)[1]
+        await safe_answer_callback(callback_query, "لغو شد")
+        batch = active_batches.pop(batch_id, None)
+        if batch:
+            set_batch_status(batch_id, "cancelled")
+            await release_space(batch_id, status="released")
+            task = batch.get("processing_task")
+            if task and not task.done():
+                task.cancel()
+            if batch.get("upload_failed"):
+                await cleanup_upload_failed(batch_id)
+            with suppress(Exception):
+                await safe_edit(callback_query.message, "⛔ بسته لغو شد")
+        return
+
+    if data.startswith("batch_confirm:"):
+        batch_id = data.split(":", 1)[1]
+        await safe_answer_callback(callback_query)
+        batch = active_batches.get(batch_id)
+        if not batch:
+            await safe_edit(callback_query.message, "⚠️ این بسته دیگر در دسترس نیست")
+            return
+        user = get_user(callback_query.message.chat.id)
+        if not user or not user.get("rubika_guid"):
+            await safe_edit(
+                callback_query.message, "🔐 ابتدا اتصال روبیکا را برقرار کنید"
+            )
+            return
+        batch["rubika_guid"] = user["rubika_guid"]
+        batch["status"] = "confirmed"
+        set_batch_status(batch_id, "confirmed", rubika_guid=user["rubika_guid"])
+        await safe_edit(callback_query.message, "⏳ فرایند آغاز شد...")
+        batch["processing_task"] = asyncio.create_task(
+            process_confirmed_batch(batch_id, callback_query.message.chat.id)
+        )
+        return
+
+    if data.startswith("job_cancel:"):
+        job_id = data.split(":", 1)[1]
+        await safe_answer_callback(callback_query)
+        job = active_jobs.get(job_id)
+        if job and not job.get("cancelled"):
+            async with job.get("status_lock", asyncio.Lock()):
+                job["cancel_confirm_shown"] = True
+                await safe_edit(
+                    job["status_message"],
+                    "⚠️ مطمئن هستید می‌خواهید فرایند را لغو کنید؟\n\nاین عملیات غیرقابل بازگشت است.",
+                    reply_markup=job_cancel_confirm_keyboard(job_id),
+                )
+        return
+
+    if data.startswith("job_cancel_confirm:"):
+        job_id = data.split(":", 1)[1]
+        await safe_answer_callback(callback_query, "فرایند لغو شد")
+        job = active_jobs.get(job_id)
+        if job:
+            async with job.get("status_lock", asyncio.Lock()):
+                job["cancelled"] = True
+                job["cancel_confirm_shown"] = False
+                task = job.get("task")
+                if task and not task.done():
+                    task.cancel()
+                with suppress(Exception):
+                    await safe_edit(
+                        job["status_message"], "⛔ فرایند لغو شد", reply_markup=None
+                    )
+        return
+
+    if data.startswith("job_cancel_cancel:"):
+        job_id = data.split(":", 1)[1]
+        await safe_answer_callback(callback_query, "لغو درخواست لغو")
+        job = active_jobs.get(job_id)
+        if job:
+            async with job.get("status_lock", asyncio.Lock()):
+                job["cancel_confirm_shown"] = False
+                with suppress(Exception):
+                    await safe_edit(
+                        job["status_message"],
+                        job.get("last_text") or "⏳ در حال پردازش...",
+                        reply_markup=progress_keyboard(job_id),
+                    )
+        return
+
+    if data.startswith("upload_retry:"):
+        batch_id = data.split(":", 1)[1]
+        await safe_answer_callback(callback_query)
+        if batch_id not in active_batches or not active_batches[batch_id].get(
+            "upload_failed"
+        ):
+            await safe_edit(
+                callback_query.message,
+                "⚠️ این درخواست امتحان مجدد دیگر معتبر نیست",
+            )
+            return
+        batch = active_batches[batch_id]
+        timeout_task = batch.get("retry_timeout_task")
+        if timeout_task and not timeout_task.done():
+            timeout_task.cancel()
+        await safe_edit(
+            callback_query.message,
+            "☁️ در حال آپلود مجدد به روبیکا...",
+            reply_markup=None,
+        )
+        zip_path_str = str(FILES_DIR / f"{batch_id}.zip")
+        try:
+            await monitored_rubika_send(
+                zip_path_str, batch["zip_name"], None, batch["rubika_guid"]
+            )
+            set_batch_status(
+                batch_id,
+                "done",
+                password=batch.get("password"),
+                zip_name=batch["zip_name"],
+                rubika_guid=batch["rubika_guid"],
+            )
+            await telegram_app.send_message(
+                callback_query.message.chat.id,
+                f"✅ ارسال با موفقیت انجام شد\n\n🗂️ نام فایل:\n`{batch['zip_name']}`\n🔐 پسورد فایل:\n`{batch.get('password')}`",
+            )
+            await cleanup_upload_failed(batch_id)
+            active_batches.pop(batch_id, None)
+        except Exception as retry_exc:
+            await safe_edit(
+                callback_query.message,
+                f"❌ خطا در آپلود مجدد:\n{str(retry_exc)[:500]}\n\n🔄 می‌توانید دوباره امتحان کنید.",
+                reply_markup=upload_retry_keyboard(batch_id),
+            )
+            new_timeout = asyncio.create_task(
+                handle_upload_retry_timeout(
+                    batch_id, callback_query.message.chat.id, callback_query.message.id
+                )
+            )
+            batch["retry_timeout_task"] = new_timeout
+        return
+
+    await safe_answer_callback(callback_query)
+
+
+async def main_runner():
+    await telegram_app.start()
+    try:
+        rubika_app.add_handler(on_rubika_update, rub_handlers.MessageUpdates())
+    except Exception:
+        pass
+    await rubika_app.run()
+
+
+if __name__ == "__main__":
+    try:
+        loop.run_until_complete(main_runner())
+    except KeyboardInterrupt:
+        pass
