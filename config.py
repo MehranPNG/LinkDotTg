@@ -16,7 +16,7 @@ def ensure_dirs() -> None:
 
 
 ensure_dirs()
-load_dotenv(CONF_DIR / ".env")
+load_dotenv(".env")
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
