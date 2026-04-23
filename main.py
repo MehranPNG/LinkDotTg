@@ -1,14 +1,11 @@
 import asyncio
 import os
-import random
 import re
 import shutil
 import sqlite3
-import string
 import time
 import pyzipper
 import aiohttp
-from dotenv import load_dotenv
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -18,39 +15,33 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from rubpy import Client as RubikaClient
 from rubpy import handlers as rub_handlers
 from urllib.parse import urlparse, unquote
-
-BASE_DIR = Path(__file__).resolve().parent
-CONF_DIR = BASE_DIR / "conf"
-SESSIONS_DIR = CONF_DIR / "sessions"
-FILES_DIR = CONF_DIR / "files"
-DB_PATH = CONF_DIR / "bot_database.sqlite3"
-
-load_dotenv(CONF_DIR / ".env")
-
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-TG_TOKEN = os.getenv("TG_TOKEN")
-RUBIKA_SESSION_NAME = str(SESSIONS_DIR / "rubika_session")
-
-AUTH_KEY_LENGTH = 64
-ZIP_PASSWORD_LENGTH = 32
-STATUS_EDIT_INTERVAL = 0.8
-ALBUM_COLLECT_DELAY = 1.2
-CHUNK_SIZE = 1024 * 1024
-MAX_UPLOAD_SIZE = int(1 * 1024 * 1024 * 1024)
-SERVER_DISK_GB_DEFAULT = 2.0
-SERVER_DISK_GB = float(os.getenv("SERVER_DISK_GB", SERVER_DISK_GB_DEFAULT))
-SERVER_DISK_BYTES = int(SERVER_DISK_GB * 1024 * 1024 * 1024)
-SPECIAL_CHARS = "!@#$%^&*()-_=+[]{};:,.?/"
-
-
-def ensure_dirs() -> None:
-    CONF_DIR.mkdir(parents=True, exist_ok=True)
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    FILES_DIR.mkdir(parents=True, exist_ok=True)
-
-
-ensure_dirs()
+from config import (
+    AUTH_KEY_LENGTH,
+    ALBUM_COLLECT_DELAY,
+    API_HASH,
+    API_ID,
+    AUTO_CANCEL_SECONDS,
+    CHUNK_SIZE,
+    DB_PATH,
+    FILES_DIR,
+    MAX_UPLOAD_SIZE,
+    RETRY_WINDOW_SECONDS,
+    RUBIKA_SESSION_NAME,
+    SESSIONS_DIR,
+    SERVER_DISK_BYTES,
+    STATUS_EDIT_INTERVAL,
+    TG_TOKEN,
+    UPLOAD_TIMEOUT_SECONDS,
+)
+from utils import (
+    generate_auth_key,
+    generate_password,
+    human_size,
+    now_ts,
+    percent_text,
+    random_text,
+    safe_name,
+)
 
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 conn.row_factory = sqlite3.Row
@@ -107,60 +98,13 @@ telegram_app = Client(
     workdir=str(SESSIONS_DIR),
 )
 
-rubika_app = RubikaClient(RUBIKA_SESSION_NAME, timeout=1800)
+rubika_app = RubikaClient(RUBIKA_SESSION_NAME, timeout=UPLOAD_TIMEOUT_SECONDS)
 
 pending_collections: Dict[str, Dict[str, Any]] = {}
 active_batches: Dict[str, Dict[str, Any]] = {}
 active_jobs: Dict[str, Dict[str, Any]] = {}
 processing_locks: Dict[int, asyncio.Lock] = {}
 db_lock = asyncio.Lock()
-
-
-def now_ts() -> int:
-    return int(time.time())
-
-
-def random_text(length: int) -> str:
-    return "".join(random.choices(string.ascii_letters + string.digits, k=length))
-
-
-def generate_auth_key() -> str:
-    return random_text(AUTH_KEY_LENGTH)
-
-
-def generate_password() -> str:
-    alphabet = string.ascii_letters + string.digits + SPECIAL_CHARS
-    rng = random.SystemRandom()
-    while True:
-        value = "".join(rng.choice(alphabet) for _ in range(ZIP_PASSWORD_LENGTH))
-        if any(ch in SPECIAL_CHARS for ch in value):
-            return value
-
-
-def safe_name(name: str, fallback: str = "file") -> str:
-    name = (name or "").strip().replace("\x00", "")
-    name = os.path.basename(name)
-    name = re.sub(r'[\\/:*?"<>|]+', "_", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name or fallback
-
-
-def human_size(size: int) -> str:
-    units = ["B", "KB", "MB", "GB", "TB"]
-    n = float(max(size, 0))
-    for unit in units:
-        if n < 1024 or unit == units[-1]:
-            if unit == "B":
-                return f"{int(n)} {unit}"
-            return f"{n:.2f} {unit}"
-        n /= 1024
-    return "0 B"
-
-
-def percent_text(done: int, total: int) -> str:
-    if not total:
-        return "0%"
-    return f"{(done / total) * 100:.1f}%"
 
 
 def get_reserved_bytes() -> int:
@@ -715,30 +659,36 @@ async def monitored_rubika_send(
         await update_status(job, "☁️ در حال آپلود به روبیکا...", force=True)
 
     sent = None
+    primary_task = None
+    fallback_task = None
     try:
-        sent = await asyncio.wait_for(
+        primary_task = asyncio.create_task(
             rubika_app.send_document(
                 object_guid=rubika_guid,
                 document=file_path,
                 caption=file_name,
-            ),
-            timeout=1800,
+            )
         )
+        sent = await asyncio.wait_for(primary_task, timeout=UPLOAD_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
-        raise TimeoutError("Timeout30")
+        if primary_task and not primary_task.done():
+            primary_task.cancel()
+        raise TimeoutError("Timeout20")
     except Exception as e1:
         try:
-            sent = await asyncio.wait_for(
+            fallback_task = asyncio.create_task(
                 rubika_app.send_message(
                     object_guid=rubika_guid,
                     text=file_name,
                     file_inline=file_path,
                     type="File",
-                ),
-                timeout=1800,
+                )
             )
+            sent = await asyncio.wait_for(fallback_task, timeout=UPLOAD_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
-            raise TimeoutError("Timeout30")
+            if fallback_task and not fallback_task.done():
+                fallback_task.cancel()
+            raise TimeoutError("Timeout20")
         except Exception as e2:
             raise RuntimeError(f"خطا در ارسال به روبیکا: {e1} | {e2}")
 
@@ -757,12 +707,27 @@ async def cleanup_upload_failed(batch_id: str) -> None:
     zip_path = FILES_DIR / f"{batch_id}.zip"
     await cleanup_paths(str(zip_path))
     await cleanup_paths(str(download_dir))
+    cursor.execute(
+        "UPDATE batch_items SET local_path = NULL WHERE batch_id = ?",
+        (batch_id,),
+    )
+    conn.commit()
+
+
+async def auto_cancel_processing(job: Dict[str, Any]) -> None:
+    await asyncio.sleep(AUTO_CANCEL_SECONDS)
+    if job.get("cancelled"):
+        return
+    job["cancelled"] = True
+    task = job.get("task")
+    if task and not task.done():
+        task.cancel()
 
 
 async def handle_upload_retry_timeout(
     batch_id: str, chat_id: int, retry_msg_id: int
 ) -> None:
-    await asyncio.sleep(300)
+    await asyncio.sleep(RETRY_WINDOW_SECONDS)
     if batch_id not in active_batches or not active_batches[batch_id].get(
         "upload_failed", False
     ):
@@ -933,7 +898,7 @@ async def queue_media_message(message) -> None:
     if not media:
         return
     if media["file_size"] > MAX_UPLOAD_SIZE:
-        await message.reply_text("📛 حجم هر آپلود نباید بیشتر از 1 گیگابایت باشد.")
+        await message.reply_text("📛 حجم هر آپلود نباید بیشتر از 500 مگابایت باشد.")
         return
     collection_key = batch_key_for_message(message)
     batch = pending_collections.get(collection_key)
@@ -959,7 +924,7 @@ async def process_confirmed_batch(batch_id: str, chat_id: int) -> None:
         return
     if batch["total_size"] > MAX_UPLOAD_SIZE:
         await telegram_app.send_message(
-            chat_id, "📛 حجم کل این بسته بیشتر از 1 گیگابایت است."
+            chat_id, "📛 حجم کل این بسته بیشتر از 500 مگابایت است."
         )
         return
     ok, available = await reserve_space(chat_id, batch_id, batch["total_size"] * 2)
@@ -1000,6 +965,7 @@ async def process_confirmed_batch(batch_id: str, chat_id: int) -> None:
         "cancel_confirm_shown": False,
         "task": asyncio.current_task(),
     }
+    job["auto_cancel_task"] = asyncio.create_task(auto_cancel_processing(job))
     active_jobs[job_id] = job
     batch["job_id"] = job_id
     lock = processing_locks.setdefault(chat_id, asyncio.Lock())
@@ -1122,18 +1088,31 @@ async def process_confirmed_batch(batch_id: str, chat_id: int) -> None:
                 batch["retry_timeout_task"] = retry_timeout_task
     except asyncio.CancelledError:
         set_batch_status(batch_id, "cancelled")
+        cursor.execute(
+            "UPDATE batch_items SET status = 'cancelled', local_path = NULL WHERE batch_id = ?",
+            (batch_id,),
+        )
+        conn.commit()
         with suppress(Exception):
             await safe_edit(
                 job["status_message"], "⛔ فرایند لغو شد", reply_markup=None
             )
     except Exception as exc:
         set_batch_status(batch_id, "failed")
+        cursor.execute(
+            "UPDATE batch_items SET status = 'failed', local_path = NULL WHERE batch_id = ?",
+            (batch_id,),
+        )
+        conn.commit()
         with suppress(Exception):
             await telegram_app.send_message(
                 chat_id,
                 f"❌ خطا در پردازش فایل\n\n{str(exc)[:500]}",
             )
     finally:
+        auto_cancel_task = job.get("auto_cancel_task")
+        if auto_cancel_task and not auto_cancel_task.done():
+            auto_cancel_task.cancel()
         await release_space(batch_id, status="released")
         should_cleanup = True
         if batch_id in active_batches and active_batches[batch_id].get(
@@ -1279,6 +1258,11 @@ async def on_callback_query(client, callback_query):
         batch = active_batches.pop(batch_id, None)
         if batch:
             set_batch_status(batch_id, "cancelled")
+            cursor.execute(
+                "UPDATE batch_items SET status = 'cancelled', local_path = NULL WHERE batch_id = ?",
+                (batch_id,),
+            )
+            conn.commit()
             await release_space(batch_id, status="released")
             task = batch.get("processing_task")
             if task and not task.done():
