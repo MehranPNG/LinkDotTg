@@ -1,56 +1,77 @@
 # Telegram → Rubika Transfer Bot
 
-## Overview
+## **Overview**
 
-This bot receives files or direct download links from Telegram, processes them, and uploads them to a connected Rubika account.
-
----
-
-## Workflow
-
-1. **Authentication**
-
-   * User gets an `auth_key` from Telegram bot
-   * Sends it to the bot in Rubika
-   * Telegram account is linked to a Rubika `guid`
-
-2. **Input**
-
-   * Accepts Telegram media or HTTP/HTTPS links
-   * Extracts file name and size
-
-3. **Batching**
-
-   * Files are grouped with a short delay
-   * A `batch_id` is created and stored
-   * User must confirm before processing
-
-4. **Processing**
-
-   * Disk space is reserved (~2× total size)
-   * Files are downloaded (Telegram or URL)
-   * All files are compressed into a password-protected ZIP
-
-5. **Upload**
-
-   * ZIP file is uploaded to Rubika
-   * Fallback methods are used if needed
-
-6. **Result**
-
-   * On success: user receives file name and password
-   * On failure: retry option is available (limited time)
-
-7. **Cleanup**
-
-   * Temporary files are removed
-   * Disk space is released
+This bot receives files and direct links from Telegram, prepares them in a controlled pipeline, and sends them to the connected Rubika account.
+The flow is designed to be reliable under load, includes queue management, and supports recovery actions when upload fails.
 
 ---
 
-## Notes
+## **Detailed Workflow**
 
-* Max file size per item: 1GB
-* Uses SQLite for state management
-* Fully async (`asyncio`)
-* Config loaded from `.env`
+1. **Authentication and account linking**
+
+   * User receives a one-time `auth_key` from the Telegram bot.
+   * The key is sent to the Rubika side to verify ownership.
+   * After verification, the Telegram user is linked to a Rubika `guid`.
+
+2. **Receiving input**
+
+   * The bot accepts Telegram media messages (document, video, audio, image, etc.).
+   * It also accepts direct `http/https` download links.
+   * File metadata is normalized (safe file name, file size, origin type).
+
+3. **Batch creation**
+
+   * Messages sent close together are grouped into one processing batch.
+   * A `batch_id` is created and tracked in the database.
+   * Before processing starts, the user must confirm the batch explicitly.
+
+4. **Validation and reservation**
+
+   * User quota is checked.
+   * Server disk reservation is created before heavy operations start.
+   * If resources are insufficient, processing is rejected early.
+
+5. **Download and preparation**
+
+   * Files are downloaded from Telegram or the provided URL.
+   * Progress is tracked and periodically updated.
+   * Partial failures are handled with cancellation and cleanup logic.
+
+6. **Compression and protection**
+
+   * Downloaded files are packed with **فشرده سازی** and password protection.
+   * The resulting package is prepared for Rubika delivery.
+   * Password generation includes required special characters.
+
+7. **Upload to Rubika**
+
+   * The packaged output is uploaded to the user’s linked Rubika account.
+   * Fallback upload methods are attempted when needed.
+   * Timeout and retry windows are enforced to avoid stale jobs.
+
+8. **Result and cleanup**
+
+   * On success, user receives package details and password.
+   * On failure, a retry option is offered for a limited period.
+   * Temporary files are deleted and disk reservations are released.
+
+---
+
+## **Admin capabilities**
+
+* Search users by Telegram chat id.
+* View usage counters and remaining quotas.
+* Increase/decrease user main quota.
+* Review queue and server free disk state.
+* Trigger cleanup operations for server-side stored files.
+
+---
+
+## **Technical notes**
+
+* Max file size per item: `1 GB`
+* SQLite is used for state management and lightweight persistence.
+* Fully asynchronous architecture based on `asyncio`.
+* Configuration values are loaded from `.env`.

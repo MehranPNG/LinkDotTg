@@ -147,7 +147,7 @@ def tehran_today() -> str:
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [["👤 حساب کاربر", "📘 راهنما"]],
+        [["📘 راهنما", "👤 حساب کاربری"]],
         resize_keyboard=True,
     )
 
@@ -420,6 +420,47 @@ async def cleanup_paths(*paths: Optional[str]) -> None:
                 shutil.rmtree(p, ignore_errors=True)
 
 
+async def admin_cleanup_storage() -> Tuple[int, int]:
+    cancelled_jobs = 0
+    for job in list(active_jobs.values()):
+        task = job.get("task")
+        if task and not task.done():
+            task.cancel()
+            cancelled_jobs += 1
+
+    for batch in list(active_batches.values()):
+        task = batch.get("processing_task")
+        if task and not task.done():
+            task.cancel()
+            cancelled_jobs += 1
+
+    pending_collections.clear()
+    active_jobs.clear()
+    active_batches.clear()
+    retry_deadlines.clear()
+    processing_queue.clear()
+    running_batches.clear()
+    running_users.clear()
+
+    removed_entries = 0
+    base_dir = Path(FILES_DIR)
+    if base_dir.exists():
+        for child in base_dir.iterdir():
+            removed_entries += 1
+            with suppress(Exception):
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink()
+    else:
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+    cursor.execute("UPDATE disk_reservations SET status = 'released' WHERE status = 'active'")
+    cursor.execute("UPDATE batch_items SET local_path = NULL")
+    conn.commit()
+    return cancelled_jobs, removed_entries
+
+
 def get_media_info(message) -> Optional[Dict[str, Any]]:
     media = (
         message.document
@@ -549,7 +590,12 @@ def upload_retry_keyboard(batch_id: str) -> InlineKeyboardMarkup:
 
 def admin_panel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🔎 جستجوی کاربر", callback_data="admin_search_user")]]
+        [
+            [
+                InlineKeyboardButton("🔎 جستجوی کاربر", callback_data="admin_search_user"),
+                InlineKeyboardButton("🧹 پاک سازی", callback_data="admin_cleanup_prompt"),
+            ]
+        ]
     )
 
 
@@ -558,14 +604,22 @@ def admin_user_manage_keyboard(user_id: int) -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton(
-                    "➕ افزایش حجم اصلی", callback_data=f"admin_volume_inc:{user_id}"
-                ),
-                InlineKeyboardButton(
                     "➖ کاهش حجم اصلی", callback_data=f"admin_volume_dec:{user_id}"
                 ),
-            ]
+                InlineKeyboardButton(
+                    "➕ افزایش حجم اصلی", callback_data=f"admin_volume_inc:{user_id}"
+                ),
+            ],
+            [InlineKeyboardButton("⬅️ بازگشت", callback_data="admin_back_main")],
         ]
     )
+
+
+def volume_text(size: int) -> str:
+    normalized = max(int(size or 0), 0)
+    if normalized >= 1024**3:
+        return f"{normalized / (1024**3):.2f} گیگابایت"
+    return mb_text(normalized)
 
 
 def user_account_text(user: Dict[str, Any]) -> str:
@@ -573,26 +627,31 @@ def user_account_text(user: Dict[str, Any]) -> str:
         "👤 حساب کاربر\n\n"
         f"🆔 چت آیدی: `{user['telegram_id']}`\n"
         f"✅ تعداد آپلود موفق کل: {int(user.get('successful_uploads', 0))}\n"
-        f"🎁 باقی مانده حجم رایگان روزانه: {mb_text(int(user.get('daily_free_remaining', 0)))}\n"
-        f"💼 باقی مانده حجم اصلی: {mb_text(int(user.get('main_remaining', 0)))}"
+        f"🎁 باقی مانده حجم رایگان روزانه: {volume_text(int(user.get('daily_free_remaining', 0)))}\n"
+        f"💼 باقی مانده حجم اصلی: {volume_text(int(user.get('main_remaining', 0)))}"
     )
 
 
 def help_text() -> str:
     return (
         "📘 راهنمای ربات\n\n"
-        "🔹 کارایی ربات:\n"
-        "انتقال فایل‌ها از تلگرام به روبیکا به صورت سریع و منظم.\n\n"
-        "🔹 پشتیبانی از لینک مستقیم:\n"
-        "با ارسال لینک مستقیم (HTTP/HTTPS)، فایل دریافت و به روبیکا آپلود می‌شود.\n\n"
-        "🔹 پشتیبانی از آپلود گروهی:\n"
-        "می‌توانید چند فایل را پشت سر هم ارسال کنید تا در یک بسته پردازش شوند.\n\n"
-        "🔹 ZIP و رمزگذاری:\n"
-        "فایل‌ها قبل از ارسال فشرده و رمزدار می‌شوند؛ به همین دلیل ارسال انواع فایل مجاز است.\n\n"
-        "🔹 حجم رایگان روزانه:\n"
-        "روزانه 100 مگابایت حجم رایگان دارید و فقط در صورت آپلود موفق از آن کم می‌شود.\n\n"
-        "🕒 پیشنهاد زمان ارسال فایل‌های حجیم:\n"
-        "برای پایداری بهتر، بازه ۳ تا ۸ صبح پیشنهاد می‌شود."
+        "<b>🔹 کارایی ربات</b>\n"
+        "این ربات فایل‌ها و لینک‌های مستقیم شما را از تلگرام دریافت می‌کند و به حساب روبیکای متصل شما می‌فرستد. "
+        "فرایند انتقال به‌صورت مرحله‌ای انجام می‌شود تا پایداری ارسال بهتر باشد.\n\n"
+        "<b>🔹 پشتیبانی از لینک مستقیم</b>\n"
+        "کافی است لینک معتبر HTTP/HTTPS ارسال کنید. ربات لینک را بررسی کرده، فایل را دریافت می‌کند "
+        "و بعد از آماده‌سازی به روبیکا منتقل می‌کند.\n\n"
+        "<b>🔹 پشتیبانی از ارسال گروهی فایل</b>\n"
+        "می‌توانید چند فایل را پشت‌سرهم بفرستید تا در یک بسته پردازش شوند. "
+        "قبل از شروع نهایی، خلاصه بسته نمایش داده می‌شود تا با اطمینان تایید کنید.\n\n"
+        "<b>🔹 فشرده سازی و رمزگذاری</b>\n"
+        "فایل‌ها پیش از ارسال در یک خروجی فشرده سازی شده و رمزدار قرار می‌گیرند. "
+        "این کار برای انتقال منظم‌تر و امن‌تر انجام می‌شود.\n\n"
+        "<b>🔹 حجم رایگان روزانه و حجم اصلی</b>\n"
+        "هر روز ۱۰۰ مگابایت حجم رایگان دارید و فقط آپلودهای موفق از سهم شما کسر می‌شوند. "
+        "اگر حجم اصلی هم داشته باشید، بعد از اتمام سهم روزانه از آن استفاده می‌شود.\n\n"
+        "<b>🔹 پیشنهاد زمان ارسال فایل‌های حجیم</b>\n"
+        "برای سرعت و پایداری بهتر، ترجیحاً فایل‌های حجیم را در ساعت‌های خلوت‌تر (مثلاً ۳ تا ۸ صبح) ارسال کنید."
     )
 
 
@@ -617,8 +676,8 @@ def admin_user_info_text(user: Dict[str, Any]) -> str:
         "👤 اطلاعات کاربر\n\n"
         f"🆔 چت آیدی: `{user['telegram_id']}`\n"
         f"✅ تعداد آپلود موفق کل: {int(user.get('successful_uploads', 0))}\n"
-        f"🎁 باقی مانده حجم رایگان روزانه: {mb_text(int(user.get('daily_free_remaining', 0)))}\n"
-        f"💼 باقی مانده حجم اصلی: {mb_text(int(user.get('main_remaining', 0)))}"
+        f"🎁 باقی مانده حجم رایگان روزانه: {volume_text(int(user.get('daily_free_remaining', 0)))}\n"
+        f"💼 باقی مانده حجم اصلی: {volume_text(int(user.get('main_remaining', 0)))}"
     )
 
 
@@ -667,7 +726,7 @@ def queue_status_text(position: int, total_queued: int) -> str:
         f"⚙️ ظرفیت پردازش همزمان: {MAX_CONCURRENT_PROCESSES}\n\n"
         "مراحل بعدی:\n"
         "1) دانلود فایل‌ها\n"
-        "2) فشرده‌سازی ZIP\n"
+        "2) فشرده سازی فایل‌ها\n"
         "3) آپلود به روبیکا"
     )
 
@@ -1155,7 +1214,7 @@ async def create_confirmation_prompt(chat_id: int, batch: Dict[str, Any]) -> Non
         f"💾 حجم کل: {human_size(batch['total_size'])}\n"
         f"🧮 فضای خالی فعلی: {human_size(available)}\n\n"
         f"{details}\n\n"
-        f"✅ با تایید، همه فایل‌ها در یک فایل ZIP فشرده و ارسال می‌شوند."
+        f"✅ با تایید، همه فایل‌ها به‌صورت فشرده سازی شده و ارسال می‌شوند."
     )
     msg = await telegram_app.send_message(
         chat_id,
@@ -1549,7 +1608,7 @@ async def tg_start(client, message):
             text,
             reply_markup=disconnect_keyboard(),
         )
-        await message.reply_text("از منوی زیر استفاده کنید 👇", reply_markup=main_menu_keyboard())
+        await message.reply_text("منو:", reply_markup=main_menu_keyboard())
     else:
         text = (
             f"👋 خوش آمدید\n\n"
@@ -1563,7 +1622,6 @@ async def tg_start(client, message):
 @telegram_app.on_message(tg_filters.command("panel") & tg_filters.private)
 async def admin_panel_command(client, message):
     if message.chat.id not in ADMIN_IDS:
-        await message.reply_text("⛔️ شما دسترسی ادمین ندارید.")
         return
     reset_daily_quotas_if_needed()
     await message.reply_text(
@@ -1576,12 +1634,14 @@ async def admin_panel_command(client, message):
 async def on_private_text_menu(client, message):
     text = (message.text or "").strip()
     user_id = message.chat.id
-    if text == "👤 حساب کاربر":
+    if text == "👤 حساب کاربری":
         user = get_or_create_user(user_id)
         await message.reply_text(user_account_text(user), reply_markup=main_menu_keyboard())
         return
     if text == "📘 راهنما":
-        await message.reply_text(help_text(), reply_markup=main_menu_keyboard())
+        await message.reply_text(
+            help_text(), reply_markup=main_menu_keyboard(), parse_mode="html"
+        )
         return
 
     state = admin_states.get(user_id)
@@ -1641,7 +1701,7 @@ async def on_private_text_menu(client, message):
 )
 async def on_media_message(client, message):
     text = (message.text or "").strip()
-    if text in {"👤 حساب کاربر", "📘 راهنما"}:
+    if text in {"👤 حساب کاربری", "📘 راهنما"}:
         return
     if text.startswith("/panel"):
         return
@@ -1700,6 +1760,55 @@ async def on_callback_query(client, callback_query):
         await telegram_app.send_message(
             admin_id,
             "🔎 چت آیدی کاربر را ارسال کنید:",
+        )
+        return
+
+    if data == "admin_back_main":
+        if admin_id not in ADMIN_IDS:
+            await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
+            return
+        await safe_answer_callback(callback_query)
+        admin_states.pop(admin_id, None)
+        await safe_edit(
+            callback_query.message,
+            admin_overview_text(),
+            reply_markup=admin_panel_keyboard(),
+        )
+        return
+
+    if data == "admin_cleanup_prompt":
+        if admin_id not in ADMIN_IDS:
+            await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
+            return
+        await safe_answer_callback(callback_query)
+        await safe_edit(
+            callback_query.message,
+            "⚠️ با تایید پاک سازی، همه فایل‌های موقت و ذخیره‌شده از سرور حذف می‌شوند.\n"
+            "آیا مطمئن هستید؟",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("✅ تایید پاک سازی", callback_data="admin_cleanup_confirm"),
+                        InlineKeyboardButton("❌ انصراف", callback_data="admin_back_main"),
+                    ]
+                ]
+            ),
+        )
+        return
+
+    if data == "admin_cleanup_confirm":
+        if admin_id not in ADMIN_IDS:
+            await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
+            return
+        await safe_answer_callback(callback_query)
+        cancelled_jobs, removed_entries = await admin_cleanup_storage()
+        await safe_edit(
+            callback_query.message,
+            "✅ پاک سازی انجام شد.\n\n"
+            f"🧾 تعداد ورودی‌های حذف‌شده از فضای فایل: {removed_entries}\n"
+            f"🛑 تعداد فرایندهای متوقف‌شده: {cancelled_jobs}\n"
+            f"💽 فضای خالی فعلی: {human_size(get_available_bytes())}",
+            reply_markup=admin_panel_keyboard(),
         )
         return
 
