@@ -38,3 +38,11 @@ UPLOAD_TIMEOUT_SECONDS = 20 * 60
 AUTO_CANCEL_SECONDS = 20 * 60
 RETRY_WINDOW_SECONDS = 5 * 60
 MAX_CONCURRENT_PROCESSES = int(os.getenv("MAX_CONCURRENT_PROCESSES", "5"))
+
+DAILY_FREE_QUOTA_MB = int(os.getenv("DAILY_FREE_QUOTA_MB", "100"))
+DAILY_FREE_QUOTA_BYTES = DAILY_FREE_QUOTA_MB * 1024 * 1024
+ADMIN_IDS = {
+    int(item.strip())
+    for item in os.getenv("ADMIN_IDS", "1267525462").split(",")
+    if item.strip().isdigit()
+}
