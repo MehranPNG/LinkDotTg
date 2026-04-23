@@ -433,6 +433,16 @@ async def add_eye_reaction(chat_id: int, message_id: int) -> None:
         )
 
 
+async def clear_reaction(chat_id: int, message_id: int) -> None:
+    with suppress(Exception):
+        await telegram_app.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=[],
+            is_big=False,
+        )
+
+
 def queue_status_text(position: int, total_queued: int) -> str:
     return (
         "⏳ بسته شما در صف قرار گرفت.\n\n"
@@ -517,6 +527,7 @@ async def update_status(job: Dict[str, Any], stage: str, force: bool = False) ->
         current_file_done = int(job.get("current_file_done", 0) or 0)
         current_file_total = int(job.get("current_file_total", 0) or 0)
         package_done = int(job.get("package_done", 0) or 0)
+        total_files = int(job.get("total_files", 0) or 0)
         speed_text = job.get("speed_text")
         lines = [stage]
         if stage == "📥 در حال دانلود...":
@@ -524,9 +535,10 @@ async def update_status(job: Dict[str, Any], stage: str, force: bool = False) ->
                 lines.append(f"🚀 سرعت: {speed_text}")
             if current_file_name:
                 lines.append(f"📄 فایل فعلی: {current_file_name}")
-            lines.append(
-                f"📤 پیشرفت فایل: {mb_text(current_file_done)} / {mb_text(current_file_total)}"
-            )
+            if total_files > 1:
+                lines.append(
+                    f"📤 پیشرفت فایل: {mb_text(current_file_done)} / {mb_text(current_file_total)}"
+                )
             lines.append(
                 f"📦 پیشرفت کل: {mb_text(package_done)} / {mb_text(total_size)}"
             )
@@ -1020,11 +1032,17 @@ async def queue_media_message(message) -> None:
             "telegram_id": message.chat.id,
             "chat_id": message.chat.id,
             "files": [],
+            "reaction_message_id": None,
         }
         pending_collections[collection_key] = batch
     task = batch.get("task")
     if task and not task.done():
         task.cancel()
+    previous_reaction_message_id = batch.get("reaction_message_id")
+    if previous_reaction_message_id:
+        await clear_reaction(message.chat.id, int(previous_reaction_message_id))
+    await add_eye_reaction(message.chat.id, int(message.id))
+    batch["reaction_message_id"] = message.id
     batch["files"].append(media)
     batch["task"] = asyncio.create_task(finalize_collection(collection_key))
 
@@ -1211,7 +1229,8 @@ async def process_confirmed_batch(batch_id: str, chat_id: int) -> None:
         prompt_message = job.get("cancel_prompt_message")
         if prompt_message:
             with suppress(Exception):
-                await prompt_message.edit_text("⛔ فرایند لغو شد")
+                await prompt_message.delete()
+        job["cancel_prompt_message"] = None
         with suppress(Exception):
             await safe_edit(
                 job["status_message"], "⛔ فرایند لغو شد", reply_markup=None
@@ -1419,9 +1438,6 @@ async def on_callback_query(client, callback_query):
             return
         batch["rubika_guid"] = user["rubika_guid"]
         set_batch_status(batch_id, "confirmed", rubika_guid=user["rubika_guid"])
-        last_message_id = batch.get("last_source_message_id")
-        if last_message_id:
-            await add_eye_reaction(callback_query.message.chat.id, int(last_message_id))
         async with queue_lock:
             can_start_now = (
                 len(running_batches) < MAX_CONCURRENT_PROCESSES
@@ -1483,7 +1499,8 @@ async def on_callback_query(client, callback_query):
                 prompt_message = job.get("cancel_prompt_message")
                 if prompt_message:
                     with suppress(Exception):
-                        await prompt_message.edit_text("⛔ فرایند لغو شد")
+                        await prompt_message.delete()
+                job["cancel_prompt_message"] = None
         return
 
     if data.startswith("job_cancel_cancel:"):
