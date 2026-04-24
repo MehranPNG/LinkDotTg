@@ -2060,7 +2060,7 @@ async def on_private_text_menu(client, message):
     user_id = message.chat.id
     user_state = user_states.get(user_id)
 
-    if text == "🆘 پشتیبانی":
+    if text in {"🆘 پشتیبانی", "☎ پشتیبانی"}:
         prompt = await message.reply_text(
             "🛟 پیام خودرا برای پشتیبانی ارسال کنید.",
             reply_markup=support_cancel_keyboard(),
@@ -2071,7 +2071,7 @@ async def on_private_text_menu(client, message):
         }
         return
 
-    if text == "🛒 خرید حجم":
+    if text in {"🛒 خرید حجم", "💎 خرید حجم"}:
         plans = load_volume_plans()
         if not plans:
             await message.reply_text(
