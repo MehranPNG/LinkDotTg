@@ -180,7 +180,7 @@ def tehran_today() -> str:
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [["👤 حساب کاربری", "💎 خرید حجم"], ["☎ پشتیبانی", "📘 راهنما"]],
+        [["👤 حساب کاربری", "🛒 خرید حجم"], ["🆘 پشتیبانی", "📘 راهنما"]],
         resize_keyboard=True,
     )
 
@@ -2038,7 +2038,6 @@ async def tg_start(client, message):
         text = (
             f"👋 خوش آمدید\n\n"
             f"🔑 کلید دسترسی شما:\n`{key}`\n\n"
-            f"🧮 فضای خالی فعلی: {human_size(available)}\n\n"
             f"📩 این کلید را برای `@acc1192` در روبیکا ارسال کنید."
         )
         await message.reply_text(text, reply_markup=main_menu_keyboard())
