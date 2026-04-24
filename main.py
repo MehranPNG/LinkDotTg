@@ -784,7 +784,7 @@ def buy_volume_plans_keyboard(plans: List[Dict[str, Any]]) -> InlineKeyboardMark
         )
         current.append(button)
         if len(current) == 2:
-            rows.append(current)
+            rows.append(list(reversed(current)))
             current = []
     if current:
         rows.append(current)
@@ -2014,33 +2014,44 @@ async def on_rubika_update(update):
 
 @telegram_app.on_message(tg_filters.command("start") & tg_filters.private)
 async def tg_start(client, message):
-    user = get_or_create_user(message.chat.id)
-    key = generate_auth_key()
-    upsert_user(message.chat.id, key, user["rubika_guid"] if user else None)
+    await send_start_like_message(message.chat.id, regenerate_key=True)
+
+
+async def send_start_like_message(telegram_id: int, regenerate_key: bool = False) -> None:
+    user = get_or_create_user(telegram_id)
+    key = user.get("auth_key") if user else None
+    if regenerate_key or not key:
+        key = generate_auth_key()
+        upsert_user(telegram_id, key, user["rubika_guid"] if user else None)
+        user = get_or_create_user(telegram_id)
     available = get_available_bytes()
-    current_user = get_or_create_user(message.chat.id)
-    if current_user and current_user.get("rubika_guid"):
+    if user and user.get("rubika_guid"):
         text = (
             f"✅ اتصال شما برقرار است\n\n"
-            f"🤖 حساب روبیکا: `{current_user['rubika_guid']}`\n\n"
+            f"🤖 حساب روبیکا: `{user['rubika_guid']}`\n\n"
             f"📤 فایل‌ها یا لینک‌های مستقیم خود را ارسال کنید تا در این حساب دریافت شوند.\n\n"
             f"🧮 فضای خالی فعلی: {human_size(available)}\n\n"
             f"🔌 برای قطع اتصال از دکمه زیر استفاده کنید."
         )
-        await message.reply_text(
+        await telegram_app.send_message(
+            telegram_id,
             text,
             reply_markup=disconnect_keyboard(),
         )
         await telegram_app.send_message(
-            message.chat.id, "منو:", reply_markup=main_menu_keyboard()
+            telegram_id, "منو:", reply_markup=main_menu_keyboard()
         )
-    else:
-        text = (
-            f"👋 خوش آمدید\n\n"
-            f"🔑 کلید دسترسی شما:\n`{key}`\n\n"
-            f"📩 این کلید را برای `@acc1192` در روبیکا ارسال کنید."
-        )
-        await message.reply_text(text, reply_markup=main_menu_keyboard())
+        return
+    text = (
+        f"👋 خوش آمدید\n\n"
+        f"🔑 کلید دسترسی شما:\n`{key}`\n\n"
+        f"📩 این کلید را برای `@acc1192` در روبیکا ارسال کنید."
+    )
+    await telegram_app.send_message(
+        telegram_id,
+        text,
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 @telegram_app.on_message(tg_filters.command("panel") & tg_filters.private)
@@ -2343,9 +2354,11 @@ async def on_callback_query(client, callback_query):
 
     if data == "support_cancel":
         await safe_answer_callback(callback_query, "لغو شد")
-        user_states.pop(callback_query.message.chat.id, None)
+        chat_id = callback_query.message.chat.id
+        user_states.pop(chat_id, None)
         with suppress(Exception):
             await callback_query.message.delete()
+        await send_start_like_message(chat_id, regenerate_key=False)
         return
 
     if data == "disconnect_prompt":
