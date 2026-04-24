@@ -1646,7 +1646,7 @@ async def on_private_text_menu(client, message):
         user = get_or_create_user(user_id)
         await message.reply_text(user_account_text(user), reply_markup=main_menu_keyboard())
         return
-    if text in {"📘 راهنما", "راهنما", "/help"}:
+    if text == "/help" or "راهنما" in text:
         await message.reply_text(
             help_text(), reply_markup=main_menu_keyboard(), parse_mode="html"
         )
@@ -1665,7 +1665,13 @@ async def on_private_text_menu(client, message):
         if not target_user:
             await message.reply_text("❌ کاربر یافت نشد.")
             return
+        prompt_message_id = state.get("prompt_message_id")
         admin_states.pop(user_id, None)
+        if prompt_message_id:
+            with suppress(Exception):
+                await telegram_app.delete_messages(user_id, prompt_message_id)
+        with suppress(Exception):
+            await message.delete()
         await message.reply_text(
             admin_user_info_text(target_user),
             reply_markup=admin_user_manage_keyboard(target_id),
@@ -1808,8 +1814,8 @@ async def on_callback_query(client, callback_query):
             reply_markup=InlineKeyboardMarkup(
                 [
                     [
-                        InlineKeyboardButton("✅ تایید پاک سازی", callback_data="admin_cleanup_confirm"),
                         InlineKeyboardButton("❌ انصراف", callback_data="admin_back_main"),
+                        InlineKeyboardButton("✅ تایید پاک سازی", callback_data="admin_cleanup_confirm"),
                     ]
                 ]
             ),
