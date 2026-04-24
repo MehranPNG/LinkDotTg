@@ -663,26 +663,15 @@ def upload_retry_keyboard(batch_id: str) -> InlineKeyboardMarkup:
 
 
 def admin_panel_keyboard() -> InlineKeyboardMarkup:
-    _, successful, _ = payments_stats()
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(
-                    "🔎 جستجوی کاربر", callback_data="admin_search_user"
-                )
+                InlineKeyboardButton("🔎 جستجوی کاربر", callback_data="admin_search_user"),
+                InlineKeyboardButton("🧹 پاک سازی", callback_data="admin_cleanup_prompt"),
             ],
             [
-                InlineKeyboardButton(
-                    "🧹 پاک سازی", callback_data="admin_cleanup_prompt"
-                ),
                 InlineKeyboardButton("🎫 تیکت‌ها", callback_data="admin_tickets_panel"),
-            ]
-            ,
-            [
-                InlineKeyboardButton(
-                    f"💳 پرداخت‌ها ({successful})",
-                    callback_data="admin_payments_panel",
-                )
+                InlineKeyboardButton("💳 پرداخت‌ها", callback_data="admin_payments_panel"),
             ],
         ]
     )
@@ -2370,8 +2359,11 @@ async def on_callback_query(client, callback_query):
 
     if data == "buy_volume_back":
         await safe_answer_callback(callback_query)
-        with suppress(Exception):
-            await callback_query.message.delete()
+        await safe_edit(
+            callback_query.message,
+            "🛒 خرید حجم\n\nبرای مشاهده پلن‌ها روی دکمه زیر بزنید:",
+            reply_markup=buy_volume_entry_keyboard(),
+        )
         return
 
     if data == "buy_stars_plans":
