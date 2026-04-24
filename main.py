@@ -1,5 +1,6 @@
 import asyncio
 import html
+import json
 import os
 import re
 import shutil
@@ -18,6 +19,7 @@ from pyrogram.errors import FloodWait
 from pyrogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LabeledPrice,
     ReplyKeyboardMarkup,
 )
 from rubpy import Client as RubikaClient
@@ -114,6 +116,21 @@ cursor.executescript(
         created_at INTEGER NOT NULL,
         answered_at INTEGER
     );
+
+    CREATE TABLE IF NOT EXISTS payments (
+        payment_code TEXT PRIMARY KEY,
+        telegram_id INTEGER NOT NULL,
+        plan_id TEXT NOT NULL,
+        plan_title TEXT NOT NULL,
+        volume_bytes INTEGER NOT NULL,
+        stars_amount INTEGER NOT NULL,
+        currency TEXT NOT NULL,
+        total_amount INTEGER NOT NULL,
+        invoice_payload TEXT NOT NULL,
+        telegram_payment_charge_id TEXT NOT NULL,
+        provider_payment_charge_id TEXT,
+        created_at INTEGER NOT NULL
+    );
     """
 )
 user_cols = {
@@ -163,9 +180,48 @@ def tehran_today() -> str:
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [["📘 راهنما", "👤 حساب کاربری"], ["🆘 پشتیبانی"]],
+        [["📘 راهنما", "👤 حساب کاربری"], ["🛒 خرید حجم", "🆘 پشتیبانی"]],
         resize_keyboard=True,
     )
+
+
+def load_volume_plans() -> List[Dict[str, Any]]:
+    path = Path(__file__).resolve().parent / "volume_plans.json"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    plans: List[Dict[str, Any]] = []
+    if not isinstance(data, list):
+        return plans
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        plan_id = str(item.get("id") or "").strip()
+        title = str(item.get("title") or "").strip()
+        stars = int(item.get("stars") or 0)
+        volume_mb = int(item.get("volume_mb") or 0)
+        if not plan_id or not title or stars <= 0 or volume_mb <= 0:
+            continue
+        plans.append(
+            {
+                "id": plan_id,
+                "title": title,
+                "stars": stars,
+                "volume_mb": volume_mb,
+                "volume_bytes": volume_mb * 1024 * 1024,
+                "description": str(item.get("description") or "").strip(),
+            }
+        )
+    return plans
+
+
+def get_volume_plan(plan_id: str) -> Optional[Dict[str, Any]]:
+    for plan in load_volume_plans():
+        if plan["id"] == plan_id:
+            return plan
+    return None
 
 
 def get_reserved_bytes() -> int:
@@ -607,6 +663,7 @@ def upload_retry_keyboard(batch_id: str) -> InlineKeyboardMarkup:
 
 
 def admin_panel_keyboard() -> InlineKeyboardMarkup:
+    _, successful, _ = payments_stats()
     return InlineKeyboardMarkup(
         [
             [
@@ -620,6 +677,13 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
                 ),
                 InlineKeyboardButton("🎫 تیکت‌ها", callback_data="admin_tickets_panel"),
             ]
+            ,
+            [
+                InlineKeyboardButton(
+                    f"💳 پرداخت‌ها ({successful})",
+                    callback_data="admin_payments_panel",
+                )
+            ],
         ]
     )
 
@@ -698,6 +762,175 @@ def admin_ticket_notify_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
 def admin_ticket_search_cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("❌ لغو", callback_data="admin_cancel_ticket_search")]]
+    )
+
+
+def buy_volume_entry_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⭐ خرید با استارز", callback_data="buy_stars_plans")]]
+    )
+
+
+def buy_volume_plans_keyboard(plans: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    current: List[InlineKeyboardButton] = []
+    for plan in plans:
+        button = InlineKeyboardButton(
+            f"{plan['title']} • {int(plan['stars'])}⭐",
+            callback_data=f"buy_plan_select:{plan['id']}",
+        )
+        current.append(button)
+        if len(current) == 2:
+            rows.append(current)
+            current = []
+    if current:
+        rows.append(current)
+    rows.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="buy_volume_back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def buy_volume_plan_details_keyboard(plan_id: str, stars_amount: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"⭐ پرداخت {int(stars_amount)} استار",
+                    callback_data=f"buy_plan_pay:{plan_id}",
+                )
+            ],
+            [InlineKeyboardButton("⬅️ بازگشت", callback_data="buy_stars_plans")],
+        ]
+    )
+
+
+def payments_stats() -> Tuple[int, int, int]:
+    tehran_now = datetime.now(ZoneInfo("Asia/Tehran"))
+    today_start = int(
+        tehran_now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    )
+    row = cursor.execute(
+        """
+        SELECT
+            COUNT(*) AS total,
+            COALESCE(SUM(stars_amount), 0) AS successful_stars,
+            SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS today_count
+        FROM payments
+        """,
+        (today_start,),
+    ).fetchone()
+    return int(row["total"] or 0), int(row["successful_stars"] or 0), int(
+        row["today_count"] or 0
+    )
+
+
+def generate_payment_code() -> str:
+    while True:
+        code = f"PAY-{random_text(10).upper()}"
+        exists = cursor.execute(
+            "SELECT 1 FROM payments WHERE payment_code = ?",
+            (code,),
+        ).fetchone()
+        if not exists:
+            return code
+
+
+def create_payment_record(
+    telegram_id: int,
+    plan: Dict[str, Any],
+    successful_payment: Any,
+) -> str:
+    payment_code = generate_payment_code()
+    cursor.execute(
+        """
+        INSERT INTO payments (
+            payment_code, telegram_id, plan_id, plan_title, volume_bytes, stars_amount,
+            currency, total_amount, invoice_payload, telegram_payment_charge_id,
+            provider_payment_charge_id, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payment_code,
+            int(telegram_id),
+            str(plan["id"]),
+            str(plan["title"]),
+            int(plan["volume_bytes"]),
+            int(plan["stars"]),
+            str(successful_payment.currency),
+            int(successful_payment.total_amount),
+            str(successful_payment.invoice_payload),
+            str(successful_payment.telegram_payment_charge_id),
+            str(successful_payment.provider_payment_charge_id or ""),
+            now_ts(),
+        ),
+    )
+    conn.commit()
+    return payment_code
+
+
+def get_payment_by_code(payment_code: str) -> Optional[sqlite3.Row]:
+    return cursor.execute(
+        """
+        SELECT payment_code, telegram_id, plan_id, plan_title, volume_bytes, stars_amount,
+               currency, total_amount, invoice_payload, telegram_payment_charge_id,
+               provider_payment_charge_id, created_at
+        FROM payments
+        WHERE payment_code = ?
+        """,
+        (payment_code,),
+    ).fetchone()
+
+
+def payment_details_text(payment: sqlite3.Row) -> str:
+    created = datetime.fromtimestamp(int(payment["created_at"]), ZoneInfo("Asia/Tehran"))
+    return (
+        "💳 اطلاعات پرداخت\n\n"
+        f"🧾 کد پرداخت: <code>{html.escape(payment['payment_code'])}</code>\n"
+        f"👤 چت آیدی کاربر: <code>{int(payment['telegram_id'])}</code>\n"
+        f"📦 پلن: {html.escape(payment['plan_title'])}\n"
+        f"📁 حجم افزوده‌شده: {volume_text(int(payment['volume_bytes']))}\n"
+        f"⭐ استار پرداختی: {int(payment['stars_amount'])}\n"
+        f"💱 ارز: <code>{html.escape(payment['currency'])}</code>\n"
+        f"🔢 total_amount: <code>{int(payment['total_amount'])}</code>\n"
+        f"🧷 payload: <code>{html.escape(payment['invoice_payload'])}</code>\n"
+        f"🆔 telegram_charge_id:\n<code>{html.escape(payment['telegram_payment_charge_id'])}</code>\n"
+        f"🕒 زمان: {created.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+
+def admin_payments_overview_text() -> str:
+    total, successful_stars, today_count = payments_stats()
+    return (
+        "💳 مدیریت پرداخت‌ها\n\n"
+        f"✅ تعداد پرداخت موفق: {total}\n"
+        f"⭐ مجموع استار دریافتی: {successful_stars}\n"
+        f"📆 پرداخت‌های امروز: {today_count}"
+    )
+
+
+def admin_payments_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📄 لیست پرداخت‌های موفق",
+                    callback_data="admin_payments_success_list",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔎 جستجوی پرداخت",
+                    callback_data="admin_payment_search",
+                )
+            ],
+            [InlineKeyboardButton("⬅️ بازگشت", callback_data="admin_back_main")],
+        ]
+    )
+
+
+def admin_payment_search_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ لغو", callback_data="admin_cancel_payment_search")]]
     )
 
 
@@ -1826,6 +2059,17 @@ async def on_private_text_menu(client, message):
         }
         return
 
+    if text == "🛒 خرید حجم":
+        plans = load_volume_plans()
+        if not plans:
+            await message.reply_text("⚠️ در حال حاضر پلن فعالی برای خرید حجم تعریف نشده است.")
+            return
+        await message.reply_text(
+            "🛒 خرید حجم\n\nبرای مشاهده پلن‌ها روی دکمه زیر بزنید:",
+            reply_markup=buy_volume_entry_keyboard(),
+        )
+        return
+
     if user_state and user_state.get("action") == "await_support_message":
         if not text:
             await message.reply_text("⚠️ لطفاً پیام متنی ارسال کنید.")
@@ -1972,6 +2216,26 @@ async def on_private_text_menu(client, message):
             reply_markup=admin_tickets_keyboard(),
         )
         return
+    if state.get("action") == "await_payment_search":
+        payment_code = text.strip().upper()
+        payment = get_payment_by_code(payment_code)
+        if not payment:
+            await message.reply_text("❌ پرداختی با این کد پیدا نشد.")
+            return
+        prompt_message_id = int(state.get("prompt_message_id") or 0)
+        admin_states.pop(user_id, None)
+        if prompt_message_id:
+            with suppress(Exception):
+                await telegram_app.delete_messages(user_id, prompt_message_id)
+        with suppress(Exception):
+            await message.delete()
+        await telegram_app.send_message(
+            user_id,
+            payment_details_text(payment),
+            parse_mode=enums.ParseMode.HTML,
+            reply_markup=admin_payments_keyboard(),
+        )
+        return
 
 
 @telegram_app.on_message(
@@ -1995,6 +2259,65 @@ async def on_media_message(client, message):
     if message.chat.id in ADMIN_IDS and admin_states.get(message.chat.id):
         return
     await queue_media_message(message)
+
+
+@telegram_app.on_pre_checkout_query()
+async def on_pre_checkout_query(client, query):
+    payload = (query.invoice_payload or "").strip()
+    if not payload.startswith("stars_buy:"):
+        await query.answer(ok=False, error_message="Invalid payment payload.")
+        return
+    plan_id = payload.split(":", 1)[1]
+    plan = get_volume_plan(plan_id)
+    if not plan:
+        await query.answer(ok=False, error_message="Selected plan is no longer available.")
+        return
+    await query.answer(ok=True)
+
+
+@telegram_app.on_message(tg_filters.successful_payment & tg_filters.private)
+async def on_successful_payment(client, message):
+    payment = message.successful_payment
+    if not payment:
+        return
+    payload = (payment.invoice_payload or "").strip()
+    if not payload.startswith("stars_buy:"):
+        return
+    plan_id = payload.split(":", 1)[1]
+    plan = get_volume_plan(plan_id)
+    if not plan:
+        await message.reply_text(
+            "⚠️ پرداخت ثبت شد اما پلن خرید دیگر در دسترس نیست. لطفاً به پشتیبانی پیام دهید."
+        )
+        return
+    update_user_main_volume(message.chat.id, int(plan["volume_bytes"]))
+    payment_code = create_payment_record(message.chat.id, plan, payment)
+    user = get_or_create_user(message.chat.id)
+    await message.reply_text(
+        "✅ پرداخت شما با موفقیت انجام شد.\n\n"
+        f"🧾 کد پرداخت: <code>{payment_code}</code>\n"
+        f"📦 پلن خریداری‌شده: {plan['title']}\n"
+        f"📁 حجم افزوده‌شده: {volume_text(int(plan['volume_bytes']))}\n"
+        f"⭐ مبلغ پرداختی: {int(plan['stars'])} استار\n\n"
+        f"💼 حجم اصلی فعلی شما: {volume_text(int(user.get('main_remaining', 0)))}",
+        parse_mode=enums.ParseMode.HTML,
+    )
+    admin_text = (
+        "💳 پرداخت موفق جدید\n\n"
+        f"🧾 کد پرداخت: <code>{payment_code}</code>\n"
+        f"👤 چت آیدی کاربر: <code>{int(message.chat.id)}</code>\n"
+        f"📦 پلن: {html.escape(plan['title'])}\n"
+        f"📁 حجم افزوده‌شده: {volume_text(int(plan['volume_bytes']))}\n"
+        f"⭐ مبلغ: {int(plan['stars'])} استار\n"
+        f"🆔 telegram_charge_id:\n<code>{html.escape(payment.telegram_payment_charge_id)}</code>"
+    )
+    for admin_chat_id in ADMIN_IDS:
+        with suppress(Exception):
+            await telegram_app.send_message(
+                admin_chat_id,
+                admin_text,
+                parse_mode=enums.ParseMode.HTML,
+            )
 
 
 @telegram_app.on_callback_query()
@@ -2045,6 +2368,75 @@ async def on_callback_query(client, callback_query):
         await safe_edit(callback_query.message, "✅ اتصال روبیکا قطع شد")
         return
 
+    if data == "buy_volume_back":
+        await safe_answer_callback(callback_query)
+        with suppress(Exception):
+            await callback_query.message.delete()
+        return
+
+    if data == "buy_stars_plans":
+        await safe_answer_callback(callback_query)
+        plans = load_volume_plans()
+        if not plans:
+            await safe_edit(
+                callback_query.message,
+                "⚠️ در حال حاضر پلن فعالی برای خرید حجم تعریف نشده است.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ بازگشت", callback_data="buy_volume_back")]]
+                ),
+            )
+            return
+        await safe_edit(
+            callback_query.message,
+            "⭐ یکی از پلن‌های حجم را انتخاب کنید:",
+            reply_markup=buy_volume_plans_keyboard(plans),
+        )
+        return
+
+    if data.startswith("buy_plan_select:"):
+        await safe_answer_callback(callback_query)
+        plan_id = data.split(":", 1)[1]
+        plan = get_volume_plan(plan_id)
+        if not plan:
+            await safe_answer_callback(
+                callback_query,
+                "این پلن دیگر در دسترس نیست.",
+                show_alert=True,
+            )
+            return
+        description = plan["description"] or "افزایش حجم اصلی حساب"
+        await safe_edit(
+            callback_query.message,
+            "🧾 تایید پلن خرید\n\n"
+            f"📦 پلن: {plan['title']}\n"
+            f"📁 حجم: {volume_text(int(plan['volume_bytes']))}\n"
+            f"⭐ هزینه: {int(plan['stars'])} استار\n"
+            f"ℹ️ توضیح: {description}",
+            reply_markup=buy_volume_plan_details_keyboard(plan_id, int(plan["stars"])),
+        )
+        return
+
+    if data.startswith("buy_plan_pay:"):
+        await safe_answer_callback(callback_query)
+        plan_id = data.split(":", 1)[1]
+        plan = get_volume_plan(plan_id)
+        if not plan:
+            await safe_answer_callback(
+                callback_query,
+                "این پلن دیگر در دسترس نیست.",
+                show_alert=True,
+            )
+            return
+        await telegram_app.send_invoice(
+            callback_query.message.chat.id,
+            title=f"خرید حجم {plan['title']}",
+            description=plan["description"] or f"افزایش حجم اصلی به {plan['title']}",
+            currency="XTR",
+            prices=[LabeledPrice(label=plan["title"], amount=int(plan["stars"]))],
+            payload=f"stars_buy:{plan_id}",
+        )
+        return
+
     if data == "admin_search_user":
         if admin_id not in ADMIN_IDS:
             await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
@@ -2073,6 +2465,87 @@ async def on_callback_query(client, callback_query):
             admin_tickets_overview_text(),
             reply_markup=admin_tickets_keyboard(),
         )
+        return
+
+    if data == "admin_payments_panel":
+        if admin_id not in ADMIN_IDS:
+            await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
+            return
+        await safe_answer_callback(callback_query)
+        admin_states.pop(admin_id, None)
+        await safe_edit(
+            callback_query.message,
+            admin_payments_overview_text(),
+            reply_markup=admin_payments_keyboard(),
+        )
+        return
+
+    if data == "admin_payments_success_list":
+        if admin_id not in ADMIN_IDS:
+            await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
+            return
+        rows = cursor.execute(
+            """
+            SELECT payment_code, telegram_id, plan_title, volume_bytes, stars_amount, created_at
+            FROM payments
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+        if not rows:
+            await safe_answer_callback(
+                callback_query,
+                "پرداخت موفقی ثبت نشده است.",
+                show_alert=True,
+            )
+            return
+        await safe_answer_callback(callback_query)
+        file_path = FILES_DIR / f"successful_payments_{now_ts()}_{admin_id}.txt"
+        with open(file_path, "w", encoding="utf-8") as f:
+            for row in rows:
+                created = datetime.fromtimestamp(
+                    int(row["created_at"]), ZoneInfo("Asia/Tehran")
+                ).strftime("%Y-%m-%d %H:%M:%S")
+                f.write(
+                    f"{row['payment_code']} | user:{int(row['telegram_id'])} | "
+                    f"plan:{row['plan_title']} | volume:{volume_text(int(row['volume_bytes']))} | "
+                    f"stars:{int(row['stars_amount'])} | time:{created}\n"
+                )
+        await telegram_app.send_document(
+            admin_id,
+            document=str(file_path),
+            caption=f"📄 تعداد پرداخت‌های موفق: {len(rows)}",
+        )
+        with suppress(Exception):
+            os.remove(file_path)
+        return
+
+    if data == "admin_payment_search":
+        if admin_id not in ADMIN_IDS:
+            await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
+            return
+        await safe_answer_callback(callback_query)
+        admin_states[admin_id] = {
+            "action": "await_payment_search",
+            "prompt_message_id": None,
+        }
+        prompt = await telegram_app.send_message(
+            admin_id,
+            "🔎 کد پرداخت را ارسال کنید (مثال: PAY-ABC12345):",
+            reply_markup=admin_payment_search_cancel_keyboard(),
+        )
+        admin_states[admin_id]["prompt_message_id"] = prompt.id
+        return
+
+    if data == "admin_cancel_payment_search":
+        if admin_id not in ADMIN_IDS:
+            await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
+            return
+        await safe_answer_callback(callback_query, "لغو شد")
+        state = admin_states.get(admin_id)
+        if state and state.get("action") == "await_payment_search":
+            admin_states.pop(admin_id, None)
+        with suppress(Exception):
+            await callback_query.message.delete()
         return
 
     if data == "admin_tickets_unanswered_list":
