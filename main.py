@@ -592,10 +592,16 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🔎 جستجوی کاربر", callback_data="admin_search_user"),
                 InlineKeyboardButton("🧹 پاک سازی", callback_data="admin_cleanup_prompt"),
+                InlineKeyboardButton("🔎 جستجوی کاربر", callback_data="admin_search_user"),
             ]
         ]
+    )
+
+
+def admin_search_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ لغو", callback_data="admin_cancel_search")]]
     )
 
 
@@ -1608,7 +1614,9 @@ async def tg_start(client, message):
             text,
             reply_markup=disconnect_keyboard(),
         )
-        await message.reply_text("منو:", reply_markup=main_menu_keyboard())
+        await telegram_app.send_message(
+            message.chat.id, "منو:", reply_markup=main_menu_keyboard()
+        )
     else:
         text = (
             f"👋 خوش آمدید\n\n"
@@ -1638,7 +1646,7 @@ async def on_private_text_menu(client, message):
         user = get_or_create_user(user_id)
         await message.reply_text(user_account_text(user), reply_markup=main_menu_keyboard())
         return
-    if text == "📘 راهنما":
+    if text in {"📘 راهنما", "راهنما", "/help"}:
         await message.reply_text(
             help_text(), reply_markup=main_menu_keyboard(), parse_mode="html"
         )
@@ -1646,6 +1654,7 @@ async def on_private_text_menu(client, message):
 
     state = admin_states.get(user_id)
     if user_id not in ADMIN_IDS or not state:
+        await queue_media_message(message)
         return
     if state.get("action") == "await_user_search":
         if not text.isdigit():
@@ -1695,16 +1704,10 @@ async def on_private_text_menu(client, message):
         | tg_filters.voice
         | tg_filters.video_note
         | tg_filters.sticker
-        | tg_filters.text
     )
     & tg_filters.private
 )
 async def on_media_message(client, message):
-    text = (message.text or "").strip()
-    if text in {"👤 حساب کاربری", "📘 راهنما"}:
-        return
-    if text.startswith("/panel"):
-        return
     if message.chat.id in ADMIN_IDS and admin_states.get(message.chat.id):
         return
     await queue_media_message(message)
@@ -1756,11 +1759,28 @@ async def on_callback_query(client, callback_query):
             await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
             return
         await safe_answer_callback(callback_query)
-        admin_states[admin_id] = {"action": "await_user_search"}
-        await telegram_app.send_message(
+        admin_states[admin_id] = {
+            "action": "await_user_search",
+            "cancelled": False,
+        }
+        prompt = await telegram_app.send_message(
             admin_id,
             "🔎 چت آیدی کاربر را ارسال کنید:",
+            reply_markup=admin_search_cancel_keyboard(),
         )
+        admin_states[admin_id]["prompt_message_id"] = prompt.id
+        return
+
+    if data == "admin_cancel_search":
+        if admin_id not in ADMIN_IDS:
+            await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
+            return
+        await safe_answer_callback(callback_query, "لغو شد")
+        state = admin_states.get(admin_id)
+        if state and state.get("action") == "await_user_search":
+            admin_states.pop(admin_id, None)
+        with suppress(Exception):
+            await callback_query.message.delete()
         return
 
     if data == "admin_back_main":
