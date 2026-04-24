@@ -1648,7 +1648,7 @@ async def on_private_text_menu(client, message):
         return
     if text == "/help" or "راهنما" in text:
         await message.reply_text(
-            help_text(), reply_markup=main_menu_keyboard(), parse_mode="html"
+            help_text(), reply_markup=main_menu_keyboard(), parse_mode="HTML"
         )
         return
 
