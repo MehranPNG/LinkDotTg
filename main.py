@@ -180,7 +180,7 @@ def tehran_today() -> str:
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [["📘 راهنما", "👤 حساب کاربری"], ["🛒 خرید حجم", "🆘 پشتیبانی"]],
+        [["👤 حساب کاربری", "💎 خرید حجم"], ["☎ پشتیبانی", "📘 راهنما"]],
         resize_keyboard=True,
     )
 
@@ -666,12 +666,18 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🔎 جستجوی کاربر", callback_data="admin_search_user"),
-                InlineKeyboardButton("🧹 پاک سازی", callback_data="admin_cleanup_prompt"),
+                InlineKeyboardButton(
+                    "🔎 جستجوی کاربر", callback_data="admin_search_user"
+                ),
+                InlineKeyboardButton(
+                    "🧹 پاک سازی", callback_data="admin_cleanup_prompt"
+                ),
             ],
             [
                 InlineKeyboardButton("🎫 تیکت‌ها", callback_data="admin_tickets_panel"),
-                InlineKeyboardButton("💳 پرداخت‌ها", callback_data="admin_payments_panel"),
+                InlineKeyboardButton(
+                    "💳 پرداخت‌ها", callback_data="admin_payments_panel"
+                ),
             ],
         ]
     )
@@ -736,7 +742,9 @@ def admin_tickets_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton("⬅️ بازگشت", callback_data="admin_back_main"),
-                InlineKeyboardButton("🔎 جستجوی تیکت", callback_data="admin_ticket_search"),
+                InlineKeyboardButton(
+                    "🔎 جستجوی تیکت", callback_data="admin_ticket_search"
+                ),
             ],
         ]
     )
@@ -744,7 +752,13 @@ def admin_tickets_keyboard() -> InlineKeyboardMarkup:
 
 def admin_ticket_notify_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✍️ پاسخ", callback_data=f"admin_ticket_reply_prompt:{ticket_id}")]]
+        [
+            [
+                InlineKeyboardButton(
+                    "✍️ پاسخ", callback_data=f"admin_ticket_reply_prompt:{ticket_id}"
+                )
+            ]
+        ]
     )
 
 
@@ -765,7 +779,7 @@ def buy_volume_plans_keyboard(plans: List[Dict[str, Any]]) -> InlineKeyboardMark
     current: List[InlineKeyboardButton] = []
     for plan in plans:
         button = InlineKeyboardButton(
-            f"{plan['title']} • {int(plan['stars'])}⭐",
+            f"{plan['title']} - ⭐ {int(plan['stars'])}",
             callback_data=f"buy_plan_select:{plan['id']}",
         )
         current.append(button)
@@ -778,7 +792,9 @@ def buy_volume_plans_keyboard(plans: List[Dict[str, Any]]) -> InlineKeyboardMark
     return InlineKeyboardMarkup(rows)
 
 
-def buy_volume_plan_details_keyboard(plan_id: str, stars_amount: int) -> InlineKeyboardMarkup:
+def buy_volume_plan_details_keyboard(
+    plan_id: str, stars_amount: int
+) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
@@ -807,8 +823,10 @@ def payments_stats() -> Tuple[int, int, int]:
         """,
         (today_start,),
     ).fetchone()
-    return int(row["total"] or 0), int(row["successful_stars"] or 0), int(
-        row["today_count"] or 0
+    return (
+        int(row["total"] or 0),
+        int(row["successful_stars"] or 0),
+        int(row["today_count"] or 0),
     )
 
 
@@ -871,7 +889,9 @@ def get_payment_by_code(payment_code: str) -> Optional[sqlite3.Row]:
 
 
 def payment_details_text(payment: sqlite3.Row) -> str:
-    created = datetime.fromtimestamp(int(payment["created_at"]), ZoneInfo("Asia/Tehran"))
+    created = datetime.fromtimestamp(
+        int(payment["created_at"]), ZoneInfo("Asia/Tehran")
+    )
     return (
         "💳 اطلاعات پرداخت\n\n"
         f"🧾 کد پرداخت: <code>{html.escape(payment['payment_code'])}</code>\n"
@@ -984,7 +1004,11 @@ def tickets_stats() -> Tuple[int, int, int]:
         FROM tickets
         """
     ).fetchone()
-    return int(row["total"] or 0), int(row["answered"] or 0), int(row["unanswered"] or 0)
+    return (
+        int(row["total"] or 0),
+        int(row["answered"] or 0),
+        int(row["unanswered"] or 0),
+    )
 
 
 def admin_tickets_overview_text() -> str:
@@ -2051,7 +2075,9 @@ async def on_private_text_menu(client, message):
     if text == "🛒 خرید حجم":
         plans = load_volume_plans()
         if not plans:
-            await message.reply_text("⚠️ در حال حاضر پلن فعالی برای خرید حجم تعریف نشده است.")
+            await message.reply_text(
+                "⚠️ در حال حاضر پلن فعالی برای خرید حجم تعریف نشده است."
+            )
             return
         await message.reply_text(
             "🛒 خرید حجم\n\nبرای مشاهده پلن‌ها روی دکمه زیر بزنید:",
@@ -2259,7 +2285,9 @@ async def on_pre_checkout_query(client, query):
     plan_id = payload.split(":", 1)[1]
     plan = get_volume_plan(plan_id)
     if not plan:
-        await query.answer(ok=False, error_message="Selected plan is no longer available.")
+        await query.answer(
+            ok=False, error_message="Selected plan is no longer available."
+        )
         return
     await query.answer(ok=True)
 
@@ -2374,7 +2402,13 @@ async def on_callback_query(client, callback_query):
                 callback_query.message,
                 "⚠️ در حال حاضر پلن فعالی برای خرید حجم تعریف نشده است.",
                 reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("⬅️ بازگشت", callback_data="buy_volume_back")]]
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "⬅️ بازگشت", callback_data="buy_volume_back"
+                            )
+                        ]
+                    ]
                 ),
             )
             return
@@ -2607,7 +2641,9 @@ async def on_callback_query(client, callback_query):
             await safe_answer_callback(callback_query, "تیکت یافت نشد", show_alert=True)
             return
         if ticket["status"] == "answered":
-            await safe_answer_callback(callback_query, "این تیکت قبلاً پاسخ داده شده است.")
+            await safe_answer_callback(
+                callback_query, "این تیکت قبلاً پاسخ داده شده است."
+            )
             return
         await safe_answer_callback(callback_query)
         prompt = await telegram_app.send_message(
