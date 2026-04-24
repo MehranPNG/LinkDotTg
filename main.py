@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
-from pyrogram import Client, filters as tg_filters
+from pyrogram import Client, filters as tg_filters, enums
 from pyrogram.errors import FloodWait
 from pyrogram.types import (
     InlineKeyboardButton,
@@ -105,11 +105,15 @@ cursor.executescript(
     );
     """
 )
-user_cols = {row["name"] for row in cursor.execute("PRAGMA table_info(users)").fetchall()}
+user_cols = {
+    row["name"] for row in cursor.execute("PRAGMA table_info(users)").fetchall()
+}
 if "successful_uploads" not in user_cols:
     cursor.execute("ALTER TABLE users ADD COLUMN successful_uploads INTEGER DEFAULT 0")
 if "daily_free_remaining" not in user_cols:
-    cursor.execute("ALTER TABLE users ADD COLUMN daily_free_remaining INTEGER DEFAULT 0")
+    cursor.execute(
+        "ALTER TABLE users ADD COLUMN daily_free_remaining INTEGER DEFAULT 0"
+    )
 if "main_remaining" not in user_cols:
     cursor.execute("ALTER TABLE users ADD COLUMN main_remaining INTEGER DEFAULT 0")
 if "daily_reset_date" not in user_cols:
@@ -455,7 +459,9 @@ async def admin_cleanup_storage() -> Tuple[int, int]:
     else:
         base_dir.mkdir(parents=True, exist_ok=True)
 
-    cursor.execute("UPDATE disk_reservations SET status = 'released' WHERE status = 'active'")
+    cursor.execute(
+        "UPDATE disk_reservations SET status = 'released' WHERE status = 'active'"
+    )
     cursor.execute("UPDATE batch_items SET local_path = NULL")
     conn.commit()
     return cancelled_jobs, removed_entries
@@ -592,8 +598,12 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🧹 پاک سازی", callback_data="admin_cleanup_prompt"),
-                InlineKeyboardButton("🔎 جستجوی کاربر", callback_data="admin_search_user"),
+                InlineKeyboardButton(
+                    "🧹 پاک سازی", callback_data="admin_cleanup_prompt"
+                ),
+                InlineKeyboardButton(
+                    "🔎 جستجوی کاربر", callback_data="admin_search_user"
+                ),
             ]
         ]
     )
@@ -831,7 +841,9 @@ async def update_status(job: Dict[str, Any], stage: str, force: bool = False) ->
             lines.append(
                 f"📦 حجم: {mb_text(current_file_done)} / {mb_text(current_file_total)}"
             )
-            lines.append(f"📊 درصد پیشرفت: {percent_text(current_file_done, current_file_total)}")
+            lines.append(
+                f"📊 درصد پیشرفت: {percent_text(current_file_done, current_file_total)}"
+            )
         elif stage == "☁️ در حال آپلود به روبیکا...":
             if current_file_name:
                 lines.append(f"📄 نام فایل: {current_file_name}")
@@ -1644,11 +1656,15 @@ async def on_private_text_menu(client, message):
     user_id = message.chat.id
     if text == "👤 حساب کاربری":
         user = get_or_create_user(user_id)
-        await message.reply_text(user_account_text(user), reply_markup=main_menu_keyboard())
+        await message.reply_text(
+            user_account_text(user), reply_markup=main_menu_keyboard()
+        )
         return
     if text == "/help" or "راهنما" in text:
         await message.reply_text(
-            help_text(), reply_markup=main_menu_keyboard(), parse_mode="HTML"
+            help_text(),
+            reply_markup=main_menu_keyboard(),
+            parse_mode=enums.ParseMode.HTML,
         )
         return
 
@@ -1814,8 +1830,12 @@ async def on_callback_query(client, callback_query):
             reply_markup=InlineKeyboardMarkup(
                 [
                     [
-                        InlineKeyboardButton("❌ انصراف", callback_data="admin_back_main"),
-                        InlineKeyboardButton("✅ تایید پاک سازی", callback_data="admin_cleanup_confirm"),
+                        InlineKeyboardButton(
+                            "❌ انصراف", callback_data="admin_back_main"
+                        ),
+                        InlineKeyboardButton(
+                            "✅ تایید پاک سازی", callback_data="admin_cleanup_confirm"
+                        ),
                     ]
                 ]
             ),
