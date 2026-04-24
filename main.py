@@ -180,7 +180,7 @@ def tehran_today() -> str:
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [["👤 حساب کاربری", "🛒 خرید حجم"], ["🆘 پشتیبانی", "📘 راهنما"]],
+        [["👤 حساب کاربری", "💎 خرید حجم"], ["☎ پشتیبانی", "📘 راهنما"]],
         resize_keyboard=True,
     )
 

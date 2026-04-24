@@ -8,14 +8,14 @@
     },
     {
         "id": "vol_1gb",
-        "title": "۱ گیگ",
+        "title": "1 گیگ",
         "volume_mb": 1024,
         "stars": 55,
         "description": "📊 افزایش حجم اصلی به مقدار ۱ گیگابایت"
     },
     {
         "id": "vol_2gb",
-        "title": "۲ گیگ",
+        "title": "2 گیگ",
         "volume_mb": 2048,
         "stars": 100,
         "description": "📊 افزایش حجم اصلی به مقدار ۲ گیگابایت"
