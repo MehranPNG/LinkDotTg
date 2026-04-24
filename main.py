@@ -103,6 +103,16 @@ cursor.executescript(
         key TEXT PRIMARY KEY,
         value TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS tickets (
+        ticket_id INTEGER PRIMARY KEY,
+        telegram_id INTEGER NOT NULL,
+        message_text TEXT NOT NULL,
+        admin_reply TEXT,
+        status TEXT NOT NULL DEFAULT 'open',
+        created_at INTEGER NOT NULL,
+        answered_at INTEGER
+    );
     """
 )
 user_cols = {
@@ -143,6 +153,7 @@ running_batches: set[str] = set()
 running_users: set[int] = set()
 retry_deadlines: Dict[str, Dict[str, int]] = {}
 admin_states: Dict[int, Dict[str, Any]] = {}
+user_states: Dict[int, Dict[str, Any]] = {}
 
 
 def tehran_today() -> str:
@@ -151,7 +162,7 @@ def tehran_today() -> str:
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [["📘 راهنما", "👤 حساب کاربری"]],
+        [["📘 راهنما", "👤 حساب کاربری"], ["🆘 پشتیبانی"]],
         resize_keyboard=True,
     )
 
@@ -599,11 +610,14 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton(
+                    "🔎 جستجوی کاربر", callback_data="admin_search_user"
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     "🧹 پاک سازی", callback_data="admin_cleanup_prompt"
                 ),
-                InlineKeyboardButton(
-                    "🔎 جستجوی کاربر", callback_data="admin_search_user"
-                ),
+                InlineKeyboardButton("🎫 تیکت‌ها", callback_data="admin_tickets_panel"),
             ]
         ]
     )
@@ -628,6 +642,144 @@ def admin_user_manage_keyboard(user_id: int) -> InlineKeyboardMarkup:
             ],
             [InlineKeyboardButton("⬅️ بازگشت", callback_data="admin_back_main")],
         ]
+    )
+
+
+def support_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ لغو", callback_data="support_cancel")]]
+    )
+
+
+def admin_ticket_reply_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ لغو", callback_data="admin_cancel_ticket_reply")]]
+    )
+
+
+def admin_ticket_view_keyboard(ticket_id: int, answered: bool) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    if not answered:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "✍️ پاسخ", callback_data=f"admin_ticket_reply_prompt:{ticket_id}"
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="admin_tickets_panel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_tickets_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📄 لیست تیکت‌های بی‌پاسخ",
+                    callback_data="admin_tickets_unanswered_list",
+                )
+            ],
+            [
+                InlineKeyboardButton("🔎 جستجوی تیکت", callback_data="admin_ticket_search"),
+                InlineKeyboardButton("⬅️ بازگشت", callback_data="admin_back_main"),
+            ],
+        ]
+    )
+
+
+def admin_ticket_notify_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✍️ پاسخ", callback_data=f"admin_ticket_reply_prompt:{ticket_id}")]]
+    )
+
+
+def admin_ticket_search_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ لغو", callback_data="admin_cancel_ticket_search")]]
+    )
+
+
+def generate_ticket_id() -> int:
+    while True:
+        ticket_id = 10000 + (int.from_bytes(os.urandom(2), "big") % 90000)
+        exists = cursor.execute(
+            "SELECT 1 FROM tickets WHERE ticket_id = ?",
+            (ticket_id,),
+        ).fetchone()
+        if not exists:
+            return ticket_id
+
+
+def create_ticket(telegram_id: int, message_text: str) -> int:
+    ticket_id = generate_ticket_id()
+    cursor.execute(
+        """
+        INSERT INTO tickets (ticket_id, telegram_id, message_text, status, created_at)
+        VALUES (?, ?, ?, 'open', ?)
+        """,
+        (ticket_id, telegram_id, message_text, now_ts()),
+    )
+    conn.commit()
+    return ticket_id
+
+
+def get_ticket(ticket_id: int) -> Optional[sqlite3.Row]:
+    return cursor.execute(
+        """
+        SELECT ticket_id, telegram_id, message_text, admin_reply, status, created_at, answered_at
+        FROM tickets
+        WHERE ticket_id = ?
+        """,
+        (ticket_id,),
+    ).fetchone()
+
+
+def answer_ticket(ticket_id: int, reply_text: str) -> None:
+    cursor.execute(
+        """
+        UPDATE tickets
+        SET admin_reply = ?, status = 'answered', answered_at = ?
+        WHERE ticket_id = ?
+        """,
+        (reply_text, now_ts(), ticket_id),
+    )
+    conn.commit()
+
+
+def tickets_stats() -> Tuple[int, int, int]:
+    row = cursor.execute(
+        """
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN status = 'answered' THEN 1 ELSE 0 END) AS answered,
+            SUM(CASE WHEN status != 'answered' THEN 1 ELSE 0 END) AS unanswered
+        FROM tickets
+        """
+    ).fetchone()
+    return int(row["total"] or 0), int(row["answered"] or 0), int(row["unanswered"] or 0)
+
+
+def admin_tickets_overview_text() -> str:
+    total, answered, unanswered = tickets_stats()
+    return (
+        "🎫 مدیریت تیکت‌ها\n\n"
+        f"📌 تعداد کل تیکت‌ها: {total}\n"
+        f"✅ تعداد پاسخ داده شده‌ها: {answered}\n"
+        f"🕓 تعداد بی‌پاسخ‌ها: {unanswered}"
+    )
+
+
+def admin_ticket_details_text(ticket: sqlite3.Row) -> str:
+    status_text = "✅ پاسخ داده شده" if ticket["status"] == "answered" else "🕓 بی‌پاسخ"
+    reply = (ticket["admin_reply"] or "—").strip() or "—"
+    return (
+        "🎫 اطلاعات تیکت\n\n"
+        f"🆔 تیکت آیدی: `{ticket['ticket_id']}`\n"
+        f"👤 چت آیدی کاربر: `{ticket['telegram_id']}`\n"
+        f"📄 متن تیکت:\n{ticket['message_text']}\n\n"
+        f"💬 پاسخ ثبت‌شده:\n{reply}\n\n"
+        f"📍 وضعیت: {status_text}"
     )
 
 
@@ -1654,6 +1806,50 @@ async def admin_panel_command(client, message):
 async def on_private_text_menu(client, message):
     text = (message.text or "").strip()
     user_id = message.chat.id
+    user_state = user_states.get(user_id)
+
+    if text == "🆘 پشتیبانی":
+        prompt = await message.reply_text(
+            "🛟 پیام خودرا برای پشتیبانی ارسال کنید.",
+            reply_markup=support_cancel_keyboard(),
+        )
+        user_states[user_id] = {
+            "action": "await_support_message",
+            "prompt_message_id": prompt.id,
+        }
+        return
+
+    if user_state and user_state.get("action") == "await_support_message":
+        if not text:
+            await message.reply_text("⚠️ لطفاً پیام متنی ارسال کنید.")
+            return
+        ticket_id = create_ticket(user_id, text)
+        prompt_message_id = int(user_state.get("prompt_message_id") or 0)
+        user_states.pop(user_id, None)
+        if prompt_message_id:
+            with suppress(Exception):
+                await telegram_app.delete_messages(user_id, prompt_message_id)
+        with suppress(Exception):
+            await message.delete()
+        await telegram_app.send_message(
+            user_id,
+            f"✅ پیام شما ارسال شد.\n🎫 تیکت {ticket_id} ثبت شد.",
+        )
+        admin_text = (
+            "📩 تیکت جدید دریافت شد\n\n"
+            f"🎫 تیکت آیدی: `{ticket_id}`\n"
+            f"👤 چت آیدی کاربر: `{user_id}`\n\n"
+            f"📄 متن پیام:\n{text}"
+        )
+        for admin_chat_id in ADMIN_IDS:
+            with suppress(Exception):
+                await telegram_app.send_message(
+                    admin_chat_id,
+                    admin_text,
+                    reply_markup=admin_ticket_notify_keyboard(ticket_id),
+                )
+        return
+
     if text == "👤 حساب کاربری":
         user = get_or_create_user(user_id)
         await message.reply_text(
@@ -1714,6 +1910,60 @@ async def on_private_text_menu(client, message):
             reply_markup=admin_user_manage_keyboard(target_id),
         )
         return
+    if state.get("action") == "await_ticket_search":
+        if not text.isdigit():
+            await message.reply_text("⚠️ لطفاً فقط تیکت آیدی عددی ارسال کنید.")
+            return
+        ticket_id = int(text)
+        ticket = get_ticket(ticket_id)
+        if not ticket:
+            await message.reply_text("❌ تیکتی با این شناسه یافت نشد.")
+            return
+        prompt_message_id = int(state.get("prompt_message_id") or 0)
+        admin_states.pop(user_id, None)
+        if prompt_message_id:
+            with suppress(Exception):
+                await telegram_app.delete_messages(user_id, prompt_message_id)
+        with suppress(Exception):
+            await message.delete()
+        await telegram_app.send_message(
+            user_id,
+            admin_ticket_details_text(ticket),
+            reply_markup=admin_ticket_view_keyboard(
+                ticket_id=ticket_id,
+                answered=ticket["status"] == "answered",
+            ),
+        )
+        return
+    if state.get("action") == "await_ticket_reply":
+        if not text:
+            await message.reply_text("⚠️ لطفاً پاسخ متنی ارسال کنید.")
+            return
+        ticket_id = int(state["ticket_id"])
+        ticket = get_ticket(ticket_id)
+        if not ticket:
+            admin_states.pop(user_id, None)
+            await message.reply_text("❌ این تیکت دیگر وجود ندارد.")
+            return
+        answer_ticket(ticket_id, text)
+        prompt_message_id = int(state.get("prompt_message_id") or 0)
+        admin_states.pop(user_id, None)
+        if prompt_message_id:
+            with suppress(Exception):
+                await telegram_app.delete_messages(user_id, prompt_message_id)
+        with suppress(Exception):
+            await message.delete()
+        with suppress(Exception):
+            await telegram_app.send_message(
+                int(ticket["telegram_id"]),
+                f"📬 پاسخ تیکت {ticket_id}:\n\n{text}",
+            )
+        await telegram_app.send_message(
+            user_id,
+            f"✅ پاسخ برای تیکت {ticket_id} ارسال شد.",
+            reply_markup=admin_tickets_keyboard(),
+        )
+        return
 
 
 @telegram_app.on_message(
@@ -1730,6 +1980,10 @@ async def on_private_text_menu(client, message):
     & tg_filters.private
 )
 async def on_media_message(client, message):
+    user_state = user_states.get(message.chat.id)
+    if user_state and user_state.get("action") == "await_support_message":
+        await message.reply_text("⚠️ لطفاً پیام پشتیبانی را به‌صورت متنی ارسال کنید.")
+        return
     if message.chat.id in ADMIN_IDS and admin_states.get(message.chat.id):
         return
     await queue_media_message(message)
@@ -1739,6 +1993,13 @@ async def on_media_message(client, message):
 async def on_callback_query(client, callback_query):
     data = callback_query.data or ""
     admin_id = callback_query.message.chat.id
+
+    if data == "support_cancel":
+        await safe_answer_callback(callback_query, "لغو شد")
+        user_states.pop(callback_query.message.chat.id, None)
+        with suppress(Exception):
+            await callback_query.message.delete()
+        return
 
     if data == "disconnect_prompt":
         await safe_answer_callback(callback_query)
@@ -1791,6 +2052,106 @@ async def on_callback_query(client, callback_query):
             reply_markup=admin_search_cancel_keyboard(),
         )
         admin_states[admin_id]["prompt_message_id"] = prompt.id
+        return
+
+    if data == "admin_tickets_panel":
+        if admin_id not in ADMIN_IDS:
+            await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
+            return
+        await safe_answer_callback(callback_query)
+        admin_states.pop(admin_id, None)
+        await safe_edit(
+            callback_query.message,
+            admin_tickets_overview_text(),
+            reply_markup=admin_tickets_keyboard(),
+        )
+        return
+
+    if data == "admin_tickets_unanswered_list":
+        if admin_id not in ADMIN_IDS:
+            await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
+            return
+        await safe_answer_callback(callback_query)
+        rows = cursor.execute(
+            "SELECT ticket_id FROM tickets WHERE status != 'answered' ORDER BY created_at ASC"
+        ).fetchall()
+        file_path = FILES_DIR / f"unanswered_tickets_{now_ts()}_{admin_id}.txt"
+        with open(file_path, "w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(f"{int(row['ticket_id'])}\n")
+        await telegram_app.send_document(
+            admin_id,
+            document=str(file_path),
+            caption=f"📄 تعداد تیکت‌های بی‌پاسخ: {len(rows)}",
+        )
+        with suppress(Exception):
+            os.remove(file_path)
+        return
+
+    if data == "admin_ticket_search":
+        if admin_id not in ADMIN_IDS:
+            await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
+            return
+        await safe_answer_callback(callback_query)
+        admin_states[admin_id] = {
+            "action": "await_ticket_search",
+            "prompt_message_id": None,
+        }
+        prompt = await telegram_app.send_message(
+            admin_id,
+            "🔎 تیکت آیدی را ارسال کنید:",
+            reply_markup=admin_ticket_search_cancel_keyboard(),
+        )
+        admin_states[admin_id]["prompt_message_id"] = prompt.id
+        return
+
+    if data == "admin_cancel_ticket_search":
+        if admin_id not in ADMIN_IDS:
+            await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
+            return
+        await safe_answer_callback(callback_query, "لغو شد")
+        state = admin_states.get(admin_id)
+        if state and state.get("action") == "await_ticket_search":
+            admin_states.pop(admin_id, None)
+        with suppress(Exception):
+            await callback_query.message.delete()
+        return
+
+    if data.startswith("admin_ticket_reply_prompt:"):
+        if admin_id not in ADMIN_IDS:
+            await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
+            return
+        ticket_id = int(data.split(":", 1)[1])
+        ticket = get_ticket(ticket_id)
+        if not ticket:
+            await safe_answer_callback(callback_query, "تیکت یافت نشد", show_alert=True)
+            return
+        if ticket["status"] == "answered":
+            await safe_answer_callback(callback_query, "این تیکت قبلاً پاسخ داده شده است.")
+            return
+        await safe_answer_callback(callback_query)
+        prompt = await telegram_app.send_message(
+            admin_id,
+            f"✍️ پاسخ تیکت {ticket_id} را ارسال کنید:",
+            reply_markup=admin_ticket_reply_cancel_keyboard(),
+        )
+        admin_states[admin_id] = {
+            "action": "await_ticket_reply",
+            "ticket_id": ticket_id,
+            "prompt_message_id": prompt.id,
+        }
+        return
+
+    if data == "admin_cancel_ticket_reply":
+        if admin_id not in ADMIN_IDS:
+            await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
+            return
+        await safe_answer_callback(callback_query, "لغو شد")
+        state = admin_states.get(admin_id)
+        if state and state.get("action") == "await_ticket_reply":
+            admin_states.pop(admin_id, None)
+        with suppress(Exception):
+            await callback_query.message.delete()
         return
 
     if data == "admin_cancel_search":
