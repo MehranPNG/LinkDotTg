@@ -3,21 +3,42 @@
         "id": "vol_512mb",
         "title": "512 مگ",
         "volume_mb": 512,
-        "stars": 1,
-        "description": "📊 افزایش حجم اصلی به مقدار ۵۱۲ مگابایت"
+        "stars": 20,
+        "description": "📊 افزایش حجم اصلی به مقدار 512 مگابایت"
     },
     {
         "id": "vol_1gb",
         "title": "1 گیگ",
         "volume_mb": 1024,
-        "stars": 55,
-        "description": "📊 افزایش حجم اصلی به مقدار ۱ گیگابایت"
+        "stars": 30,
+        "description": "📊 افزایش حجم اصلی به مقدار 1 گیگابایت"
     },
     {
         "id": "vol_2gb",
         "title": "2 گیگ",
         "volume_mb": 2048,
-        "stars": 100,
-        "description": "📊 افزایش حجم اصلی به مقدار ۲ گیگابایت"
+        "stars": 50,
+        "description": "📊 افزایش حجم اصلی به مقدار 2 گیگابایت"
+    },
+    {
+        "id": "vol_3gb",
+        "title": "3 گیگ",
+        "volume_mb": 3072,
+        "stars": 70,
+        "description": "📊 افزایش حجم اصلی به مقدار 3 گیگابایت"
+    },
+    {
+        "id": "vol_5gb",
+        "title": "5 گیگ",
+        "volume_mb": 5120,
+        "stars": 110,
+        "description": "📊 افزایش حجم اصلی به مقدار 5 گیگابایت"
+    },
+    {
+        "id": "vol_10gb",
+        "title": "10 گیگ",
+        "volume_mb": 10240,
+        "stars": 210,
+        "description": "📊 افزایش حجم اصلی به مقدار 10 گیگابایت"
     }
 ]
