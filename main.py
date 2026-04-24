@@ -1,4 +1,5 @@
 import asyncio
+import html
 import os
 import re
 import shutil
@@ -681,8 +682,8 @@ def admin_tickets_keyboard() -> InlineKeyboardMarkup:
                 )
             ],
             [
-                InlineKeyboardButton("🔎 جستجوی تیکت", callback_data="admin_ticket_search"),
                 InlineKeyboardButton("⬅️ بازگشت", callback_data="admin_back_main"),
+                InlineKeyboardButton("🔎 جستجوی تیکت", callback_data="admin_ticket_search"),
             ],
         ]
     )
@@ -709,6 +710,10 @@ def generate_ticket_id() -> int:
         ).fetchone()
         if not exists:
             return ticket_id
+
+
+def ticket_id_monospace(ticket_id: int) -> str:
+    return f"<code>{int(ticket_id)}</code>"
 
 
 def create_ticket(telegram_id: int, message_text: str) -> int:
@@ -773,12 +778,14 @@ def admin_tickets_overview_text() -> str:
 def admin_ticket_details_text(ticket: sqlite3.Row) -> str:
     status_text = "✅ پاسخ داده شده" if ticket["status"] == "answered" else "🕓 بی‌پاسخ"
     reply = (ticket["admin_reply"] or "—").strip() or "—"
+    ticket_text = html.escape(ticket["message_text"])
+    reply_text = html.escape(reply)
     return (
         "🎫 اطلاعات تیکت\n\n"
-        f"🆔 تیکت آیدی: `{ticket['ticket_id']}`\n"
-        f"👤 چت آیدی کاربر: `{ticket['telegram_id']}`\n"
-        f"📄 متن تیکت:\n{ticket['message_text']}\n\n"
-        f"💬 پاسخ ثبت‌شده:\n{reply}\n\n"
+        f"🆔 تیکت آیدی: {ticket_id_monospace(int(ticket['ticket_id']))}\n"
+        f"👤 چت آیدی کاربر: <code>{int(ticket['telegram_id'])}</code>\n"
+        f"📄 متن تیکت:\n{ticket_text}\n\n"
+        f"💬 پاسخ ثبت‌شده:\n{reply_text}\n\n"
         f"📍 وضعیت: {status_text}"
     )
 
@@ -1823,29 +1830,29 @@ async def on_private_text_menu(client, message):
         if not text:
             await message.reply_text("⚠️ لطفاً پیام متنی ارسال کنید.")
             return
+        safe_user_text = html.escape(text)
         ticket_id = create_ticket(user_id, text)
         prompt_message_id = int(user_state.get("prompt_message_id") or 0)
         user_states.pop(user_id, None)
         if prompt_message_id:
             with suppress(Exception):
                 await telegram_app.delete_messages(user_id, prompt_message_id)
-        with suppress(Exception):
-            await message.delete()
-        await telegram_app.send_message(
-            user_id,
-            f"✅ پیام شما ارسال شد.\n🎫 تیکت {ticket_id} ثبت شد.",
+        await message.reply_text(
+            f"✅ پیام شما ارسال شد.\n🎫 تیکت {ticket_id_monospace(ticket_id)} ثبت شد.",
+            parse_mode=enums.ParseMode.HTML,
         )
         admin_text = (
             "📩 تیکت جدید دریافت شد\n\n"
-            f"🎫 تیکت آیدی: `{ticket_id}`\n"
-            f"👤 چت آیدی کاربر: `{user_id}`\n\n"
-            f"📄 متن پیام:\n{text}"
+            f"🎫 تیکت آیدی: {ticket_id_monospace(ticket_id)}\n"
+            f"👤 چت آیدی کاربر: <code>{user_id}</code>\n\n"
+            f"📄 متن پیام:\n{safe_user_text}"
         )
         for admin_chat_id in ADMIN_IDS:
             with suppress(Exception):
                 await telegram_app.send_message(
                     admin_chat_id,
                     admin_text,
+                    parse_mode=enums.ParseMode.HTML,
                     reply_markup=admin_ticket_notify_keyboard(ticket_id),
                 )
         return
@@ -1929,6 +1936,7 @@ async def on_private_text_menu(client, message):
         await telegram_app.send_message(
             user_id,
             admin_ticket_details_text(ticket),
+            parse_mode=enums.ParseMode.HTML,
             reply_markup=admin_ticket_view_keyboard(
                 ticket_id=ticket_id,
                 answered=ticket["status"] == "answered",
@@ -1939,6 +1947,7 @@ async def on_private_text_menu(client, message):
         if not text:
             await message.reply_text("⚠️ لطفاً پاسخ متنی ارسال کنید.")
             return
+        safe_admin_reply = html.escape(text)
         ticket_id = int(state["ticket_id"])
         ticket = get_ticket(ticket_id)
         if not ticket:
@@ -1952,15 +1961,14 @@ async def on_private_text_menu(client, message):
             with suppress(Exception):
                 await telegram_app.delete_messages(user_id, prompt_message_id)
         with suppress(Exception):
-            await message.delete()
-        with suppress(Exception):
             await telegram_app.send_message(
                 int(ticket["telegram_id"]),
-                f"📬 پاسخ تیکت {ticket_id}:\n\n{text}",
+                f"📬 پاسخ تیکت {ticket_id_monospace(ticket_id)}:\n\n{safe_admin_reply}",
+                parse_mode=enums.ParseMode.HTML,
             )
-        await telegram_app.send_message(
-            user_id,
-            f"✅ پاسخ برای تیکت {ticket_id} ارسال شد.",
+        await message.reply_text(
+            f"✅ پاسخ برای تیکت {ticket_id_monospace(ticket_id)} ارسال شد.",
+            parse_mode=enums.ParseMode.HTML,
             reply_markup=admin_tickets_keyboard(),
         )
         return
@@ -2071,10 +2079,17 @@ async def on_callback_query(client, callback_query):
         if admin_id not in ADMIN_IDS:
             await safe_answer_callback(callback_query, "دسترسی ندارید", show_alert=True)
             return
-        await safe_answer_callback(callback_query)
         rows = cursor.execute(
             "SELECT ticket_id FROM tickets WHERE status != 'answered' ORDER BY created_at ASC"
         ).fetchall()
+        if not rows:
+            await safe_answer_callback(
+                callback_query,
+                "تیکت بی‌پاسخی وجود ندارد.",
+                show_alert=True,
+            )
+            return
+        await safe_answer_callback(callback_query)
         file_path = FILES_DIR / f"unanswered_tickets_{now_ts()}_{admin_id}.txt"
         with open(file_path, "w", encoding="utf-8") as f:
             for row in rows:
@@ -2132,7 +2147,8 @@ async def on_callback_query(client, callback_query):
         await safe_answer_callback(callback_query)
         prompt = await telegram_app.send_message(
             admin_id,
-            f"✍️ پاسخ تیکت {ticket_id} را ارسال کنید:",
+            f"✍️ پاسخ تیکت {ticket_id_monospace(ticket_id)} را ارسال کنید:",
+            parse_mode=enums.ParseMode.HTML,
             reply_markup=admin_ticket_reply_cancel_keyboard(),
         )
         admin_states[admin_id] = {
