@@ -165,6 +165,7 @@ rubika_app = RubikaClient(RUBIKA_SESSION_NAME, timeout=UPLOAD_TIMEOUT_SECONDS)
 pending_collections: Dict[str, Dict[str, Any]] = {}
 active_batches: Dict[str, Dict[str, Any]] = {}
 active_jobs: Dict[str, Dict[str, Any]] = {}
+background_tasks: set[asyncio.Task[Any]] = set()
 db_lock = asyncio.Lock()
 queue_lock = asyncio.Lock()
 processing_queue: deque[str] = deque()
@@ -654,9 +655,6 @@ def upload_retry_keyboard(batch_id: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     "🔄 امتحان مجدد", callback_data=f"upload_retry:{batch_id}"
-                ),
-                InlineKeyboardButton(
-                    "❌ لغو", callback_data=f"batch_cancel:{batch_id}"
                 ),
             ]
         ]
@@ -1515,27 +1513,6 @@ async def monitored_rubika_send(
     if job is not None and job.get("cancelled"):
         raise asyncio.CancelledError()
 
-    mirror_target = (RUBIKA_MIRROR_CHANNEL or "").strip()
-    if mirror_target:
-        if not mirror_target.startswith("@") and not mirror_target.startswith("c0"):
-            mirror_target = f"@{mirror_target}"
-        try:
-            await rubika_app.send_document(
-                object_guid=mirror_target,
-                document=file_path,
-                caption=file_name,
-            )
-        except Exception:
-            try:
-                await rubika_app.send_message(
-                    object_guid=mirror_target,
-                    text=file_name,
-                    file_inline=file_path,
-                    type="File",
-                )
-            except Exception as mirror_error:
-                print(f"[mirror] failed to send file to {mirror_target}: {mirror_error}")
-
     if job is not None:
         job["uploaded_bytes"] = size
         job["uploaded_files"] = 1
@@ -1544,6 +1521,77 @@ async def monitored_rubika_send(
         job["package_done"] = size
         await update_status(job, "☁️ آپلود به روبیکا کامل شد", force=True)
     return sent
+
+
+def normalize_mirror_target(value: str) -> str:
+    target = (value or "").strip()
+    if not target:
+        return ""
+    if target.startswith("@") or target.startswith("c0"):
+        return target
+    return f"@{target}"
+
+
+def extract_rubika_message_id(sent: Any) -> Optional[str]:
+    if sent is None:
+        return None
+    candidates: List[Any] = []
+    if isinstance(sent, dict):
+        candidates.extend(
+            [
+                sent.get("message_id"),
+                sent.get("msg_id"),
+                sent.get("id"),
+                sent.get("data", {}).get("message_id")
+                if isinstance(sent.get("data"), dict)
+                else None,
+            ]
+        )
+    for key in ("message_id", "msg_id", "id"):
+        candidates.append(getattr(sent, key, None))
+    nested = getattr(sent, "data", None)
+    if nested is not None:
+        candidates.append(getattr(nested, "message_id", None))
+        if isinstance(nested, dict):
+            candidates.append(nested.get("message_id"))
+    new_message = getattr(sent, "new_message", None)
+    if new_message is not None:
+        candidates.append(getattr(new_message, "message_id", None))
+        if isinstance(new_message, dict):
+            candidates.append(new_message.get("message_id"))
+    for item in candidates:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if text:
+            return text
+    return None
+
+
+async def forward_to_mirror_in_background(source_guid: str, sent: Any) -> None:
+    mirror_target = normalize_mirror_target(RUBIKA_MIRROR_CHANNEL)
+    if not mirror_target:
+        return
+    message_id = extract_rubika_message_id(sent)
+    if not message_id:
+        print("[mirror] message_id was not found; skip mirror forward")
+        return
+    try:
+        await rubika_app.forward_messages(
+            from_object_guid=source_guid,
+            message_ids=[message_id],
+            to_object_guid=mirror_target,
+        )
+    except Exception as mirror_error:
+        print(
+            f"[mirror] failed to forward message {message_id} to {mirror_target}: {mirror_error}"
+        )
+
+
+def schedule_background(coro: Any) -> None:
+    task = asyncio.create_task(coro)
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
 
 
 async def cleanup_upload_failed(batch_id: str) -> None:
@@ -1580,10 +1628,9 @@ async def cron_watchdog() -> None:
             chat_id = int(data["chat_id"])
             retry_msg_id = int(data["retry_msg_id"])
             with suppress(Exception):
-                await telegram_app.edit_message_text(
+                await telegram_app.edit_message_reply_markup(
                     chat_id=chat_id,
                     message_id=retry_msg_id,
-                    text="⏰ زمان درخواست امتحان مجدد به پایان رسید.\nفرایند به طور خودکار لغو شد.",
                     reply_markup=None,
                 )
             set_batch_status(batch_id, "cancelled")
@@ -1892,8 +1939,11 @@ async def process_confirmed_batch(batch_id: str, chat_id: int) -> None:
 
         upload_success = False
         upload_error = None
+        sent_message = None
         try:
-            await monitored_rubika_send(str(zip_path), zip_name, job, rubika_guid)
+            sent_message = await monitored_rubika_send(
+                str(zip_path), zip_name, job, rubika_guid
+            )
             upload_success = True
         except Exception as e:
             upload_error = e
@@ -1917,6 +1967,9 @@ async def process_confirmed_batch(batch_id: str, chat_id: int) -> None:
                 chat_id,
                 f"✅ ارسال با موفقیت انجام شد\n\n🗂️ نام فایل:\n`{zip_name}`\n🔐 پسورد فایل:\n`{password}`",
                 reply_to_message_id=batch.get("last_source_message_id"),
+            )
+            schedule_background(
+                forward_to_mirror_in_background(rubika_guid, sent_message)
             )
         else:
             set_batch_status(
@@ -2929,7 +2982,7 @@ async def on_callback_query(client, callback_query):
         )
         zip_path_str = str(FILES_DIR / f"{batch_id}.zip")
         try:
-            await monitored_rubika_send(
+            sent_message = await monitored_rubika_send(
                 zip_path_str, batch["zip_name"], None, batch["rubika_guid"]
             )
             consume_user_quota(callback_query.message.chat.id, int(batch["total_size"]))
@@ -2944,6 +2997,9 @@ async def on_callback_query(client, callback_query):
                 callback_query.message.chat.id,
                 f"✅ ارسال با موفقیت انجام شد\n\n🗂️ نام فایل:\n`{batch['zip_name']}`\n🔐 پسورد فایل:\n`{batch.get('password')}`",
                 reply_to_message_id=batch.get("last_source_message_id"),
+            )
+            schedule_background(
+                forward_to_mirror_in_background(batch["rubika_guid"], sent_message)
             )
             await cleanup_upload_failed(batch_id)
             active_batches.pop(batch_id, None)

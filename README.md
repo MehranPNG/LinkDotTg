@@ -80,3 +80,4 @@ The flow is designed to be reliable under load, includes queue management, and s
 
 * `RUBIKA_MIRROR_CHANNEL` (optional): mirror every successful uploaded file to this Rubika channel too.  
   Example: `data_saves` or `@data_saves` or a direct channel guid (`c0...`).
+* Mirror is done in background via Rubika `forward_messages`, so user success message + password is not delayed.
