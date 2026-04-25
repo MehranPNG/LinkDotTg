@@ -174,6 +174,7 @@ running_users: set[int] = set()
 retry_deadlines: Dict[str, Dict[str, int]] = {}
 admin_states: Dict[int, Dict[str, Any]] = {}
 user_states: Dict[int, Dict[str, Any]] = {}
+mirror_target_guid_cache: Dict[str, str] = {}
 
 
 def tehran_today() -> str:
@@ -1532,38 +1533,108 @@ def normalize_mirror_target(value: str) -> str:
     return f"@{target}"
 
 
-def extract_rubika_message_id(sent: Any) -> Optional[str]:
-    if sent is None:
+def extract_chat_guid(chat_info: Any) -> Optional[str]:
+    def walk_values(node: Any) -> List[str]:
+        values: List[str] = []
+        if node is None:
+            return values
+        if isinstance(node, (str, int)):
+            values.append(str(node))
+            return values
+        if isinstance(node, list):
+            for item in node:
+                values.extend(walk_values(item))
+            return values
+        if isinstance(node, dict):
+            for key in ("object_guid", "chat_guid", "guid"):
+                value = node.get(key)
+                if value is not None:
+                    values.append(str(value))
+            for item in node.values():
+                values.extend(walk_values(item))
+            return values
+        raw = getattr(node, "original_update", None)
+        if isinstance(raw, dict):
+            values.extend(walk_values(raw))
+            return values
+        for key in ("object_guid", "chat_guid", "guid", "data"):
+            value = getattr(node, key, None)
+            if value is not None:
+                values.extend(walk_values(value))
+        return values
+
+    for item in walk_values(chat_info):
+        text = str(item).strip()
+        if text.startswith("c0"):
+            return text
+    return None
+
+
+async def resolve_mirror_target_guid(target: str) -> Optional[str]:
+    if not target:
         return None
-    candidates: List[Any] = []
-    if isinstance(sent, dict):
-        candidates.extend(
-            [
-                sent.get("message_id"),
-                sent.get("msg_id"),
-                sent.get("id"),
-                (
-                    sent.get("data", {}).get("message_id")
-                    if isinstance(sent.get("data"), dict)
-                    else None
-                ),
-            ]
-        )
-    for key in ("message_id", "msg_id", "id"):
-        candidates.append(getattr(sent, key, None))
-    nested = getattr(sent, "data", None)
-    if nested is not None:
-        candidates.append(getattr(nested, "message_id", None))
-        if isinstance(nested, dict):
-            candidates.append(nested.get("message_id"))
-    new_message = getattr(sent, "new_message", None)
-    if new_message is not None:
-        candidates.append(getattr(new_message, "message_id", None))
-        if isinstance(new_message, dict):
-            candidates.append(new_message.get("message_id"))
-    for item in candidates:
-        if item is None:
+    if target in mirror_target_guid_cache:
+        return mirror_target_guid_cache[target]
+    if target.startswith("c0"):
+        mirror_target_guid_cache[target] = target
+        return target
+
+    lookup_candidates = [target]
+    if target.startswith("@"):
+        lookup_candidates.append(target[1:])
+    else:
+        lookup_candidates.append(f"@{target}")
+
+    for candidate in lookup_candidates:
+        try:
+            info = await rubika_app.get_object_by_username(candidate.replace("@", ""))
+        except Exception:
+            info = None
+        if info is None:
+            with suppress(Exception):
+                info = await rubika_app.get_info(username=candidate.replace("@", ""))
+        if info is None:
             continue
+        guid = extract_chat_guid(info)
+        if guid:
+            mirror_target_guid_cache[target] = guid
+            mirror_target_guid_cache[candidate] = guid
+            return guid
+    return None
+
+
+def extract_rubika_message_id(sent: Any) -> Optional[str]:
+    def walk_for_message_ids(node: Any) -> List[str]:
+        values: List[str] = []
+        if node is None:
+            return values
+        if isinstance(node, list):
+            for item in node:
+                values.extend(walk_for_message_ids(item))
+            return values
+        if isinstance(node, dict):
+            for key in ("message_id", "msg_id", "id"):
+                value = node.get(key)
+                if value is not None:
+                    values.append(str(value))
+            for item in node.values():
+                values.extend(walk_for_message_ids(item))
+            return values
+        raw = getattr(node, "original_update", None)
+        if isinstance(raw, dict):
+            values.extend(walk_for_message_ids(raw))
+            return values
+        for key in ("message_id", "msg_id", "id", "data", "new_message"):
+            value = getattr(node, key, None)
+            if value is not None:
+                values.extend(walk_for_message_ids(value))
+        return values
+
+    for item in walk_for_message_ids(sent):
+        text = str(item).strip()
+        if text and text.isdigit():
+            return text
+    for item in walk_for_message_ids(sent):
         text = str(item).strip()
         if text:
             return text
@@ -1574,6 +1645,10 @@ async def forward_to_mirror_in_background(source_guid: str, sent: Any) -> None:
     mirror_target = normalize_mirror_target(RUBIKA_MIRROR_CHANNEL)
     if not mirror_target:
         return
+    mirror_target_guid = await resolve_mirror_target_guid(mirror_target)
+    if not mirror_target_guid:
+        print(f"[mirror] failed to resolve mirror target guid: {mirror_target}")
+        return
     message_id = extract_rubika_message_id(sent)
     if not message_id:
         print("[mirror] message_id was not found; skip mirror forward")
@@ -1582,11 +1657,11 @@ async def forward_to_mirror_in_background(source_guid: str, sent: Any) -> None:
         await rubika_app.forward_messages(
             from_object_guid=source_guid,
             message_ids=[message_id],
-            to_object_guid=mirror_target,
+            to_object_guid=mirror_target_guid,
         )
     except Exception as mirror_error:
         print(
-            f"[mirror] failed to forward message {message_id} to {mirror_target}: {mirror_error}"
+            f"[mirror] failed to forward message {message_id} to {mirror_target_guid}: {mirror_error}"
         )
 
 
