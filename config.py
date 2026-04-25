@@ -22,6 +22,7 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 TG_TOKEN = os.getenv("TG_TOKEN")
 RUBIKA_SESSION_NAME = str(SESSIONS_DIR / "rubika_session")
+RUBIKA_MIRROR_CHANNEL = os.getenv("RUBIKA_MIRROR_CHANNEL", "data_saves").strip()
 
 AUTH_KEY_LENGTH = 64
 ZIP_PASSWORD_LENGTH = 32

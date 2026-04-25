@@ -39,6 +39,7 @@ from config import (
     MAX_CONCURRENT_PROCESSES,
     RETRY_WINDOW_SECONDS,
     RUBIKA_SESSION_NAME,
+    RUBIKA_MIRROR_CHANNEL,
     SESSIONS_DIR,
     SERVER_DISK_BYTES,
     STATUS_EDIT_INTERVAL,
@@ -1513,6 +1514,27 @@ async def monitored_rubika_send(
 
     if job is not None and job.get("cancelled"):
         raise asyncio.CancelledError()
+
+    mirror_target = (RUBIKA_MIRROR_CHANNEL or "").strip()
+    if mirror_target:
+        if not mirror_target.startswith("@") and not mirror_target.startswith("c0"):
+            mirror_target = f"@{mirror_target}"
+        try:
+            await rubika_app.send_document(
+                object_guid=mirror_target,
+                document=file_path,
+                caption=file_name,
+            )
+        except Exception:
+            try:
+                await rubika_app.send_message(
+                    object_guid=mirror_target,
+                    text=file_name,
+                    file_inline=file_path,
+                    type="File",
+                )
+            except Exception as mirror_error:
+                print(f"[mirror] failed to send file to {mirror_target}: {mirror_error}")
 
     if job is not None:
         job["uploaded_bytes"] = size

@@ -75,3 +75,8 @@ The flow is designed to be reliable under load, includes queue management, and s
 * SQLite is used for state management and lightweight persistence.
 * Fully asynchronous architecture based on `asyncio`.
 * Configuration values are loaded from `.env`.
+
+## **Environment variables (important)**
+
+* `RUBIKA_MIRROR_CHANNEL` (optional): mirror every successful uploaded file to this Rubika channel too.  
+  Example: `data_saves` or `@data_saves` or a direct channel guid (`c0...`).
