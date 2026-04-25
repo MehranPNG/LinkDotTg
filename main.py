@@ -1542,9 +1542,11 @@ def extract_rubika_message_id(sent: Any) -> Optional[str]:
                 sent.get("message_id"),
                 sent.get("msg_id"),
                 sent.get("id"),
-                sent.get("data", {}).get("message_id")
-                if isinstance(sent.get("data"), dict)
-                else None,
+                (
+                    sent.get("data", {}).get("message_id")
+                    if isinstance(sent.get("data"), dict)
+                    else None
+                ),
             ]
         )
     for key in ("message_id", "msg_id", "id"):
