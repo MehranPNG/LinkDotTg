@@ -1528,7 +1528,7 @@ def normalize_mirror_target(value: str) -> str:
     target = (value or "").strip()
     if not target:
         return ""
-    if target.startswith("@") or target.startswith("c0"):
+    if target.startswith("@") or target.startswith(("c0", "g0", "u0")):
         return target
     return f"@{target}"
 
@@ -1576,7 +1576,7 @@ def extract_chat_guid(chat_info: Any) -> Optional[str]:
         if not item:
             continue
         text = str(item).strip()
-        if text.startswith("c0"):
+        if text.startswith(("c0", "g0", "u0")):
             return text
     return None
 
@@ -1586,7 +1586,7 @@ async def resolve_mirror_target_guid(target: str) -> Optional[str]:
         return None
     if target in mirror_target_guid_cache:
         return mirror_target_guid_cache[target]
-    if target.startswith("c0"):
+    if target.startswith(("c0", "g0", "u0")):
         mirror_target_guid_cache[target] = target
         return target
 
@@ -1598,7 +1598,7 @@ async def resolve_mirror_target_guid(target: str) -> Optional[str]:
 
     for candidate in lookup_candidates:
         try:
-            info = await rubika_app.get_chat_info(candidate)
+            info = await rubika_app.get_object_by_username(candidate)
         except Exception:
             continue
         guid = extract_chat_guid(info)
